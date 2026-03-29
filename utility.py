@@ -1,0 +1,41 @@
+import jax.numpy as jnp
+
+
+#Some functions for moving data around
+#Or reshaping arrays into the shape needed for the forward model
+#Forward model wants the shape [Nions, Nt, Nk]
+
+def reshape_moments(Q, Nions, Nt):
+    #If the input is scalar:
+    if jnp.ndim(Q)==0:
+        return jnp.ones((Nions, Nt))[:, :, jnp.newaxis] * Q
+
+    # Check to see if it's only 1D, eg one ion species
+    if jnp.ndim(Q) == 1:
+        # If it is, reshape to (, Nt, )
+        return Q[jnp.newaxis, :, jnp.newaxis]
+    elif jnp.ndim(Q) == 2:
+        #This is if it's in the shape (Nions, Nt) already
+        #Recast as (Nions, Nt,)
+        return Q[:, :, jnp.newaxis]
+
+# This matches the shapes of a, b 1D arrays to be [Na, Nb]
+# It's here because interpax can't broadcast -.-
+
+#Pulls params out of a output.params object
+def extract_params_as_array(params, var, Nindices):
+    var_array = jnp.zeros_like(Nindices)
+    for i in range(Nindices):
+        var_array[i] = params[var + f"_{i}"]
+    return var_array
+
+#Adds a profile of params to an existing lmfit Parameters object
+def add_params_from_array(params, var, value_array, settings):
+    Nvalues = len(value_array)
+    if isinstance(settings, dict):
+        settings = [settings] * Nvalues
+    for i in range(Nvalues):
+        params.add(var + f"_{i}", value=value_array[i], **settings[i])
+    #params are mutable (I think) so no return is needed?
+
+
