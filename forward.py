@@ -75,6 +75,7 @@ def _spectral_density(
     we = w - ue * k * jnp.dot(ue_dir, k_vec)
     wi = w - ui * k * jnp.dot(ui_dir, k_vec)
 
+
     #Scattering parameter alpha
     #alpha = jnp.sqrt(2) * wpe / np.outer(k, vT_e)
 
@@ -215,6 +216,22 @@ def _scattered_power_wavelength(
         normalization_type = "integral",
         normalization_scale = 1
 ):
+    Nelectrons = jnp.shape(efract)[0]
+    Nions = jnp.shape(ifract)[0]
+    Nt = jnp.shape(n)[0]
+
+    #reshape everything to be (Nions, Nt, Nk)
+    n = reshape_moments(n, Nions, Nt)
+    ue = reshape_moments(ue, Nelectrons, Nt)
+    ui = reshape_moments(ui, Nions, Nt)
+    Te = reshape_moments(Te, Nelectrons, Nt)
+    Ti = reshape_moments(Ti, Nions, Nt)
+    pe = reshape_moments(pe, Nelectrons, Nt)
+    pi = reshape_moments(pi, Nions, Nt)
+    efract = reshape_moments(efract, Nelectrons, Nt)
+    ifract = reshape_moments(ifract, Nions, Nt)
+    ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
+    ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
     Skw = _spectral_density(
         n,
         ue,
@@ -227,7 +244,7 @@ def _scattered_power_wavelength(
         ifract,
         ion_z,
         ion_a,
-        wavelengths,
+        wavelengths[jnp.newaxis, jnp.newaxis, :],
         probe_wavelength,
         probe_vec,
         scatter_vec,
@@ -237,12 +254,14 @@ def _scattered_power_wavelength(
 
     #Convert to wavelength space
     #Correction by dw/d(lambda) ~ lambda**(-2)
-    Sklam = Skw / wavelengths**2
+    Sklam = Skw / wavelengths[:, jnp.newaxis]**2
 
     #Now correct by (1+2w/wl) as given in Sheffield Eq. 5.1
     ws = 2 * jnp.pi * c / wavelengths
     wl = 2 * jnp.pi * c / probe_wavelength
     w = ws - wl
+
+    w = w[:, jnp.newaxis]
 
     Pklam = Sklam * (1 + 2 * w / wl)
 
@@ -255,9 +274,9 @@ def _scattered_power_wavelength(
         Pklam = vmap(jnp.convolve, in_axes=1, out_axes=1)(Pklam, instr_func_arr, mode = "same")
 
     #3 normalization options, based on setting the max, sum, or integral (dlambda) to 1
-    normalization = normalization_scale * ((normalization_type=="max") / jnp.max(Pklam)
-                                           + (normalization_type=="sum") / jnp.sum(Pklam)
-                                           + (normalization_type=="integral") / jnp.trapezoid(Pklam, wavelengths))
+    normalization = normalization_scale * ((normalization_type=="max") / jnp.max(Pklam, axis = 0)
+                                           + (normalization_type=="sum") / jnp.sum(Pklam, axis = 0)
+                                           + (normalization_type=="integral") / jnp.trapezoid(Pklam, wavelengths, axis = 0))
 
     Pklam /= normalization
 
@@ -266,7 +285,9 @@ def _scattered_power_wavelength(
     return Pklam
 
 
+def scattered_power_wavelength(*args, **kwargs):
 
+    return _scattered_power_wavelength(*args, **kwargs)
 
 
 
