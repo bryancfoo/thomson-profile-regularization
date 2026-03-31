@@ -41,21 +41,36 @@ def _tikhonov_penalty(param_array,
 
 # the prior distribution, defined by the Tikhonov penalties
 def _log_prior(params, Nindices, penalty_settings):
-    # penalty_settings should be a dict where each key is a param name
+    # penalty_settings keys can be species-specific ("Ti0", "Ti1") or
+    # global ("Ti"), which applies to all species sharing that base name.
+    # For each param prefix found in params, we look up penalty settings
+    # from most-specific to least-specific, mirroring build_minimal_params.
+    def _lookup(prefix):
+        base = prefix.rstrip('0123456789')
+        if prefix in penalty_settings:
+            return penalty_settings[prefix]
+        if base in penalty_settings:
+            return penalty_settings[base]
+        return None
+
+    # Collect unique {var}{species} prefixes by stripping the trailing _{t}
+    prefixes = dict.fromkeys(key.rsplit("_", 1)[0] for key in params)
+
     total_penalty = 0
-    for var_key in penalty_settings:
-        # for each var, extract the relevant array and then compute the penalty
-        # Note that the penalty_settings are customizable as dicts
-        param_array = extract_params_as_array(params, var_key, Nindices)
-        total_penalty += _tikhonov_penalty(param_array, **penalty_settings[var_key])
+    for prefix in prefixes:
+        settings = _lookup(prefix)
+        if settings is None:
+            continue
+        param_array = extract_params_as_array(params, prefix, Nindices)
+        total_penalty += _tikhonov_penalty(param_array, **settings)
     return total_penalty
 
 #Now define the full objective function which sums the log_likelihood + log_prior to get the log posterior
-def _log_posterior(params, Skw_data, Skw_var, measurement_settings, penalty_settings, use_penalty = True):
+def _log_posterior(params, Pkl_data, Pkl_var, measurement_settings, penalty_settings, use_penalty = True):
     #First count the number of species for both electrons and ions
     Nelectrons = measurement_settings["Nelectrons"] #for the electrons I'll take this as an explicit input
     Nions = len(measurement_settings["ion_z"])
-    Nt = jnp.shape(Skw_data)[1] #number of time steps is the second dimension of the data
+    Nt = jnp.shape(Pkl_data)[1] #number of time steps is the second dimension of the data
     # Build parameter arrays for electrons and ions using extract_params_as_array
     # Total electron density `n` is time-series (no species index): n_{t}
 
@@ -124,7 +139,7 @@ def _log_posterior(params, Skw_data, Skw_var, measurement_settings, penalty_sett
     )
 
     # Compute likelihood (data fidelity)
-    ll = _log_likelihood(fit, Skw_data, Skw_var)
+    ll = _log_likelihood(fit, Pkl_data, Pkl_var)
 
     # Compute prior penalty if requested
     prior = 0
@@ -132,6 +147,138 @@ def _log_posterior(params, Skw_data, Skw_var, measurement_settings, penalty_sett
         prior = _log_prior(params, Nt, penalty_settings)
 
     return ll + prior
+
+
+def run_fit(
+    Pkl_data,
+    Pkl_var,
+    measurement_settings,
+    penalty_settings=None,
+    initial_params=None,
+    fit_settings=None,
+):
+    """Run the regularized Thomson scattering fit on a streak.
+
+    Parameters
+    ----------
+    Pkl_data : array (Nk, Nt)
+        Measured scattered power spectrum (wavelength × time).
+    Pkl_var : array (Nk, Nt)
+        Variance of the measured data.
+    measurement_settings : dict
+        Static geometry and composition settings. Required keys:
+        Nelectrons, ion_z, ion_a, wavelengths, probe_wavelength,
+        probe_vec, scatter_vec, ue_dir, ui_dir.
+        Optional: instr_func_arr, normalization_type, normalization_scale.
+    penalty_settings : dict or None
+        Tikhonov regularization settings keyed by parameter name.
+        Passed directly to _log_prior. None disables regularization.
+    initial_params : dict or None
+        Initial-guess values passed into build_minimal_params. Supports keys
+        at three levels of specificity (e.g. "Te", "Te0", or "Te0_3").
+        If None, build_minimal_params defaults are used.
+    fit_settings : dict or None
+        Optimizer settings. Supported keys:
+          - 'method' (str, default 'nelder'): method string for lmfit Minimizer
+          - any other keys are passed through as kwargs to Minimizer.minimize()
+
+    Returns
+    -------
+    result : lmfit.MinimizerResult
+        Full result from lmfit, including result.params with the best-fit
+        values and result.success indicating convergence.
+    """
+    if fit_settings is None:
+        fit_settings = {}
+    fit_settings = dict(fit_settings)  # copy to avoid mutating caller's dict
+    method = fit_settings.pop("method", "nelder")
+
+    Nelectrons = measurement_settings["Nelectrons"]
+    Nions = len(measurement_settings["ion_z"])
+    Nt = jnp.shape(Pkl_data)[1]
+
+    params = build_minimal_params(Nelectrons, Nions, Nt, initial_params)
+
+    Pkl_data = jnp.array(Pkl_data)
+    Pkl_var = jnp.array(Pkl_var)
+
+    def objective(p):
+        return _log_posterior(p, Pkl_data, Pkl_var, measurement_settings, penalty_settings)
+
+    minner = Minimizer(objective, params)
+    result = minner.minimize(method=method, **fit_settings)
+
+    return result
+
+
+def _scale_penalty_settings(penalty_settings, weight_scale, cutoff_scale):
+    """Return a copy of penalty_settings with lambda_weights and thresholds scaled."""
+    scaled = {}
+    for key, settings in penalty_settings.items():
+        s = dict(settings)
+        s["lambda_weights"] = [w * weight_scale for w in settings["lambda_weights"]]
+        s["thresholds"] = [t * cutoff_scale for t in settings["thresholds"]]
+        scaled[key] = s
+    return scaled
+
+
+def chi2_vary_tikhonov(
+    Pkl_data,
+    Pkl_var,
+    measurement_settings,
+    penalty_settings,
+    weight_scales,
+    cutoff_scales,
+    initial_params=None,
+    fit_settings=None,
+):
+    """Scan Tikhonov weights and thresholds and return chi2 on a 2D grid.
+
+    For each (weight_scale, cutoff_scale) pair, all lambda_weights in
+    penalty_settings are multiplied by weight_scale and all thresholds by
+    cutoff_scale. A full fit is run at each grid point and the log likelihood
+    (chi2, data fidelity only — no regularization penalty) is recorded.
+
+    The tightest penalties that don't significantly inflate chi2 relative to
+    the unregularized fit are the most physically motivated.
+
+    Parameters
+    ----------
+    Pkl_data, Pkl_var, measurement_settings, initial_params, fit_settings :
+        Same as run_fit.
+    penalty_settings : dict
+        Base penalty settings (must not be None).
+    weight_scales : array-like
+        Multiplicative scale factors applied to all lambda_weights.
+    cutoff_scales : array-like
+        Multiplicative scale factors applied to all thresholds.
+
+    Returns
+    -------
+    chi2 : jnp.array, shape (len(weight_scales), len(cutoff_scales))
+        Log likelihood (chi2) at the best-fit parameters for each grid point.
+    """
+    Pkl_data = jnp.array(Pkl_data)
+    Pkl_var = jnp.array(Pkl_var)
+
+    chi2_grid = jnp.zeros((len(weight_scales), len(cutoff_scales)))
+    for i, ws in enumerate(weight_scales):
+        for j, cs in enumerate(cutoff_scales):
+            scaled = _scale_penalty_settings(penalty_settings, ws, cs)
+            result = run_fit(
+                Pkl_data, Pkl_var, measurement_settings,
+                penalty_settings=scaled,
+                initial_params=initial_params,
+                fit_settings=fit_settings,
+            )
+            # Evaluate log likelihood only (no regularization) at best-fit params
+            chi2_val = float(_log_posterior(
+                result.params, Pkl_data, Pkl_var,
+                measurement_settings, penalty_settings=None, use_penalty=False,
+            ))
+            chi2_grid = chi2_grid.at[i, j].set(chi2_val)
+
+    return chi2_grid
 
 
 def build_minimal_params(Nelectrons, Nions, Nt, initial_params=None):
