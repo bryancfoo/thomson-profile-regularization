@@ -154,7 +154,7 @@ def run_fit(
     Pkl_var,
     measurement_settings,
     penalty_settings=None,
-    initial_params=None,
+    params_settings=None,
     fit_settings=None,
 ):
     """Run the regularized Thomson scattering fit on a streak.
@@ -173,10 +173,11 @@ def run_fit(
     penalty_settings : dict or None
         Tikhonov regularization settings keyed by parameter name.
         Passed directly to _log_prior. None disables regularization.
-    initial_params : dict or None
-        Initial-guess values passed into build_minimal_params. Supports keys
-        at three levels of specificity (e.g. "Te", "Te0", or "Te0_3").
-        If None, build_minimal_params defaults are used.
+    params_settings : dict or None
+        Per-parameter lmfit kwargs passed into build_params. Supports the same
+        three-level key specificity ("Te", "Te0", "Te0_3"). Values are dicts of
+        lmfit.Parameters.add() kwargs, e.g. {"value": 100.0, "vary": False, "min": 0}.
+        If None, build_params defaults are used.
     fit_settings : dict or None
         Optimizer settings. Supported keys:
           - 'method' (str, default 'nelder'): method string for lmfit Minimizer
@@ -197,7 +198,7 @@ def run_fit(
     Nions = len(measurement_settings["ion_z"])
     Nt = jnp.shape(Pkl_data)[1]
 
-    params = build_minimal_params(Nelectrons, Nions, Nt, initial_params)
+    params = build_params(Nelectrons, Nions, Nt, params_settings)
 
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
@@ -229,7 +230,7 @@ def chi2_vary_tikhonov(
     penalty_settings,
     weight_scales,
     cutoff_scales,
-    initial_params=None,
+    params_settings=None,
     fit_settings=None,
 ):
     """Scan Tikhonov weights and thresholds and return chi2 on a 2D grid.
@@ -244,7 +245,7 @@ def chi2_vary_tikhonov(
 
     Parameters
     ----------
-    Pkl_data, Pkl_var, measurement_settings, initial_params, fit_settings :
+    Pkl_data, Pkl_var, measurement_settings, params_settings, fit_settings :
         Same as run_fit.
     penalty_settings : dict
         Base penalty settings (must not be None).
@@ -268,7 +269,7 @@ def chi2_vary_tikhonov(
             result = run_fit(
                 Pkl_data, Pkl_var, measurement_settings,
                 penalty_settings=scaled,
-                initial_params=initial_params,
+                params_settings=params_settings,
                 fit_settings=fit_settings,
             )
             # Evaluate log likelihood only (no regularization) at best-fit params
@@ -281,54 +282,67 @@ def chi2_vary_tikhonov(
     return chi2_grid
 
 
-def build_minimal_params(Nelectrons, Nions, Nt, initial_params=None):
+def build_params(Nelectrons, Nions, Nt, params_settings=None):
     """Build an lmfit.Parameters object with the naming scheme used by the fitter.
 
     Parameters created follow the pattern <var><species>_<time>, e.g. `Te0_0`, `Ti1_3`.
-    initial_params may be a dict providing initial guesses. Supported keys:
-      - per-time, per-species: "ne1_0" -> used directly
-      - per-species uniform: "ne1" -> applied to all times for species 1
-      - global uniform: "ne" -> applied to all species and times
 
-    The function also creates `efract{species}_{t}` and `ifract{species}_{t}` entries.
+    params_settings is a dict mapping parameter keys to dicts of lmfit.Parameters.add()
+    kwargs (e.g. {"value": 100.0, "vary": False, "min": 0}). Keys use the same
+    three-level specificity as penalty_settings:
+      - per-time, per-species: "Te0_3" -> species 0 at t=3 only
+      - per-species:           "Te0"   -> all times for species 0
+      - global:                "Te"    -> all Te species at all times
+    For `n` (no species index), the lookup checks "n_<t>" (time-specific) then "n" (global).
+    User-supplied kwargs are merged on top of per-variable defaults, so partial
+    dicts like {"vary": False} are fine — the default value is still applied.
+
     Returns an lmfit.Parameters instance.
     """
     p = Parameters()
-    if initial_params is None:
-        initial_params = {}
+    if params_settings is None:
+        params_settings = {}
 
     def _lookup(base, species, t, default):
-        # check most-specific to least-specific
-        key_specific = f"{base}{species}_{t}"
-        key_species = f"{base}{species}"
+        # check most-specific to least-specific, merge user settings onto defaults
+        # if species is None, skip the species-level keys (used for `n` which has no species)
+        if species is None:
+            key_specific = f"{base}_{t}"
+            key_species = None
+        else:
+            key_specific = f"{base}{species}_{t}"
+            key_species = f"{base}{species}"
         key_global = base
-        if key_specific in initial_params:
-            return initial_params[key_specific]
-        if key_species in initial_params:
-            return initial_params[key_species]
-        if key_global in initial_params:
-            return initial_params[key_global]
-        return default
-    
+
+        if key_specific in params_settings:
+            user = params_settings[key_specific]
+        elif key_species is not None and key_species in params_settings:
+            user = params_settings[key_species]
+        elif key_global in params_settings:
+            user = params_settings[key_global]
+        else:
+            user = {}
+        return {**default, **user}
+
     # total electron density time-series `n_{t}` (no species index)
     for t in range(Nt):
-        p.add(f"n_{t}", value=_lookup("n", 0, t, 1e20)) # default 1e20 m^-3, converted to cm^-3 in forward model
+        p.add(f"n_{t}", **_lookup("n", None, t, {"value": 1e20}))
 
     # electron moments
     for s in range(Nelectrons):
         for t in range(Nt):
-            p.add(f"Te{s}_{t}", value=_lookup("Te", s, t, 100.0))
-            p.add(f"ue{s}_{t}", value=_lookup("ue", s, t, 0.0))
-            p.add(f"pe{s}_{t}", value=_lookup("pe", s, t, 2.0))
-            p.add(f"efract{s}_{t}", value=_lookup("efract", s, t, 1.0))
+            p.add(f"Te{s}_{t}", **_lookup("Te", s, t, {"value": 100.0}))
+            p.add(f"ue{s}_{t}", **_lookup("ue", s, t, {"value": 0.0}))
+            p.add(f"pe{s}_{t}", **_lookup("pe", s, t, {"value": 2.0}))
+            p.add(f"efract{s}_{t}", **_lookup("efract", s, t, {"value": 1.0}))
 
     # ion moments
     for s in range(Nions):
         for t in range(Nt):
-            p.add(f"Ti{s}_{t}", value=_lookup("Ti", s, t, 100.0))
-            p.add(f"ui{s}_{t}", value=_lookup("ui", s, t, 0.0))
-            p.add(f"pi{s}_{t}", value=_lookup("pi", s, t, 2.0))
-            p.add(f"ifract{s}_{t}", value=_lookup("ifract", s, t, 1.0))
+            p.add(f"Ti{s}_{t}", **_lookup("Ti", s, t, {"value": 100.0}))
+            p.add(f"ui{s}_{t}", **_lookup("ui", s, t, {"value": 0.0}))
+            p.add(f"pi{s}_{t}", **_lookup("pi", s, t, {"value": 2.0}))
+            p.add(f"ifract{s}_{t}", **_lookup("ifract", s, t, {"value": 1.0}))
 
     return p
 
