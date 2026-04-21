@@ -29,6 +29,33 @@ def extract_params_as_array(params, var, Nindices):
         var_array = var_array.at[i].set(params[f"{var}_{i}"])
     return var_array
 
+def extract_all_params_as_dict(params):
+    """Extract all lmfit parameters into a dict of arrays, grouped by prefix.
+
+    Parameters named like `Te0_3` are split into prefix `Te0` and index `3`.
+    Each prefix maps to a 1-D array of its values ordered by index.
+
+    Returns
+    -------
+    dict mapping prefix (str) -> jnp.array of values
+    """
+    from collections import defaultdict
+    import re
+
+    # Group key names by their prefix (everything before the last _<digits>)
+    prefix_indices = defaultdict(list)
+    for key in params:
+        m = re.match(r"^(.+)_(\d+)$", key)
+        if m:
+            prefix_indices[m.group(1)].append(int(m.group(2)))
+
+    result = {}
+    for prefix, indices in prefix_indices.items():
+        Nindices = max(indices) + 1
+        result[prefix] = extract_params_as_array(params, prefix, Nindices)
+    return result
+
+
 #Adds a profile of params to an existing lmfit Parameters object
 def add_params_from_array(params, var, value_array, settings):
     Nvalues = len(value_array)

@@ -1,15 +1,19 @@
 import jax.numpy as jnp
+from jax import jit
 from lmfit import Parameters, Minimizer
 from utility import extract_params_as_array
 from forward import _scattered_power_wavelength
 from scipy.constants import c, k as kB, epsilon_0, e, m_p
+
+_jitted_scattered_power_wavelength = jit(_scattered_power_wavelength,
+                                         static_argnames=('normalization_type', 'notch'))
 
 #Now for building the fitter
 
 #Log likelihood of the fit being measured out of the data, obtained by averaging over the residuals
 #The reason I average and not sum is to make the regularization weights not depend on number of timesteps
 def _log_likelihood(fit, data, variance):
-    return jnp.mean((fit - data) ** 2 / variance)
+    return jnp.nanmean((fit - data) ** 2 / variance)
 
 
 #no input sanitization here
@@ -19,18 +23,28 @@ def _tikhonov_penalty(param_array,
                      lambda_weights,
                      thresholds,
                      relative = True,
-                     norm_scale = 1):
+                     norm_scale = 1,
+                     monotonic = 0):
     penalty = 0
     deriv = param_array.copy() #the current derivative being penalized. Starts at 0th
 
-    #If relative, the norm_scale is also relative
-    norm_scale = norm_scale * (1 + relative * (jnp.abs(param_array) - 1))
+    if not hasattr(norm_scale, '__len__'):
+        norm_scale = [norm_scale] * len(lambda_weights)
+    if not hasattr(monotonic, '__len__'):
+        monotonic = [monotonic] * len(lambda_weights)
+
+    relative_factor = 1 + relative * (jnp.abs(param_array) - 1)
 
     for order in range(len(lambda_weights)):
         # penalty only kicks in at the threshold
         # also scale by relative and also norm_scale as needed
-        current_threshold = thresholds[order] / (1 + relative * (jnp.abs(param_array) - 1))
-        adjusted_deriv = jnp.maximum(0, jnp.abs(deriv) - current_threshold) / norm_scale
+        current_threshold = thresholds[order] / relative_factor
+        current_norm = norm_scale[order] * relative_factor
+        if monotonic[order] == 0:
+            signed_deriv = jnp.abs(deriv)
+        else:
+            signed_deriv = monotonic[order] * deriv
+        adjusted_deriv = jnp.maximum(0, signed_deriv - current_threshold) / current_norm
         penalty += (lambda_weights[order] #weight of the penalty
                     * jnp.mean(adjusted_deriv**2))
 
@@ -62,19 +76,18 @@ def _log_prior(params, Nindices, penalty_settings):
         if settings is None:
             continue
         param_array = extract_params_as_array(params, prefix, Nindices)
-        total_penalty += _tikhonov_penalty(param_array, **settings)
+        #print(prefix, settings)
+        current_penalty = _tikhonov_penalty(param_array, **settings)
+        total_penalty += current_penalty
+        #print(prefix, current_penalty)
     return total_penalty
 
-#Now define the full objective function which sums the log_likelihood + log_prior to get the log posterior
-def _log_posterior(params, Pkl_data, Pkl_var, measurement_settings, penalty_settings, use_penalty = True):
-    #First count the number of species for both electrons and ions
-    Nelectrons = measurement_settings["Nelectrons"] #for the electrons I'll take this as an explicit input
+def _compute_fit(params, measurement_settings):
+    """Evaluate the forward model at the given params and return scattered_power_wavelength."""
+    Nelectrons = measurement_settings["Nelectrons"]
     Nions = len(measurement_settings["ion_z"])
-    Nt = jnp.shape(Pkl_data)[1] #number of time steps is the second dimension of the data
-    # Build parameter arrays for electrons and ions using extract_params_as_array
-    # Total electron density `n` is time-series (no species index): n_{t}
+    Nt = len([k for k in params if k.startswith("n_")])
 
-    # Extract total electron density time-series from params
     n = extract_params_as_array(params, "n", Nt)
 
     Te = jnp.zeros((Nelectrons, Nt))
@@ -97,25 +110,7 @@ def _log_posterior(params, Pkl_data, Pkl_var, measurement_settings, penalty_sett
         pi = pi.at[i, :].set(extract_params_as_array(params, f"pi{i}", Nt))
         ifract = ifract.at[i, :].set(extract_params_as_array(params, f"ifract{i}", Nt))
 
-    # Read measurement/static settings required by the forward model
-    # efract and ifract are now fitted moments (in `params`), so read
-    # ion composition and optics from measurement_settings
-    ion_z = measurement_settings["ion_z"]
-    ion_a = measurement_settings["ion_a"]
-    wavelengths = measurement_settings["wavelengths"]
-    probe_wavelength = measurement_settings["probe_wavelength"]
-    probe_vec = measurement_settings["probe_vec"]
-    scatter_vec = measurement_settings["scatter_vec"]
-    ue_dir = measurement_settings["ue_dir"]
-    ui_dir = measurement_settings["ui_dir"]
-    instr_func_arr = measurement_settings.get("instr_func_arr", None)
-    normalization_type = measurement_settings.get("normalization_type", "integral")
-    normalization_scale = measurement_settings.get("normalization_scale", 1)
-
-    # efract and ifract have been populated in the species loops above
-
-    # Call forward model to get the fit
-    fit = _scattered_power_wavelength(
+    return _jitted_scattered_power_wavelength(
         n=n * 1e6,
         ue=ue,
         ui=ui,
@@ -125,27 +120,27 @@ def _log_posterior(params, Pkl_data, Pkl_var, measurement_settings, penalty_sett
         pi=pi,
         efract=efract,
         ifract=ifract,
-        ion_z=ion_z,
-        ion_a=ion_a,
-        wavelengths=wavelengths,
-        probe_wavelength=probe_wavelength,
-        probe_vec=probe_vec,
-        scatter_vec=scatter_vec,
-        ue_dir=ue_dir,
-        ui_dir=ui_dir,
-        instr_func_arr=instr_func_arr,
-        normalization_type=normalization_type,
-        normalization_scale=normalization_scale,
+        ion_z=measurement_settings["ion_z"],
+        ion_a=measurement_settings["ion_a"],
+        wavelengths=measurement_settings["wavelengths"],
+        probe_wavelength=measurement_settings["probe_wavelength"],
+        probe_vec=measurement_settings["probe_vec"],
+        scatter_vec=measurement_settings["scatter_vec"],
+        ue_dir=measurement_settings["ue_dir"],
+        ui_dir=measurement_settings["ui_dir"],
+        instr_func_arr=measurement_settings.get("instr_func_arr", None),
+        normalization_type=measurement_settings.get("normalization_type", "max"),
+        normalization_scale=measurement_settings.get("normalization_scale", 1),
+        notch=measurement_settings.get("notch", None),
     )
 
-    # Compute likelihood (data fidelity)
+
+#Now define the full objective function which sums the log_likelihood + log_prior to get the log posterior
+def _log_posterior(params, Pkl_data, Pkl_var, measurement_settings, penalty_settings, use_penalty=True):
+    Nt = jnp.shape(Pkl_data)[1]
+    fit = _compute_fit(params, measurement_settings)
     ll = _log_likelihood(fit, Pkl_data, Pkl_var)
-
-    # Compute prior penalty if requested
-    prior = 0
-    if use_penalty and penalty_settings is not None:
-        prior = _log_prior(params, Nt, penalty_settings)
-
+    prior = _log_prior(params, Nt, penalty_settings) if (use_penalty and penalty_settings is not None) else 0
     return ll + prior
 
 
@@ -156,6 +151,7 @@ def run_fit(
     penalty_settings=None,
     params_settings=None,
     fit_settings=None,
+    progress=False,
 ):
     """Run the regularized Thomson scattering fit on a streak.
 
@@ -182,12 +178,17 @@ def run_fit(
         Optimizer settings. Supported keys:
           - 'method' (str, default 'nelder'): method string for lmfit Minimizer
           - any other keys are passed through as kwargs to Minimizer.minimize()
+    progress : bool
+        If True, display a tqdm progress bar updated each iteration showing
+        the current objective value.
 
     Returns
     -------
     result : lmfit.MinimizerResult
         Full result from lmfit, including result.params with the best-fit
         values and result.success indicating convergence.
+    best_fit : jnp.array, shape (Nk, Nt)
+        Scattered power spectrum evaluated at the best-fit parameters.
     """
     if fit_settings is None:
         fit_settings = {}
@@ -206,10 +207,32 @@ def run_fit(
     def objective(p):
         return _log_posterior(p, Pkl_data, Pkl_var, measurement_settings, penalty_settings)
 
-    minner = Minimizer(objective, params)
-    result = minner.minimize(method=method, **fit_settings)
+    iter_cb = None
+    if progress:
+        from tqdm.auto import tqdm
+        from collections import deque
+        bar = tqdm(desc=f"run_fit ({method})", unit="iter")
+        window = deque(maxlen=50)
 
-    return result
+        def iter_cb(_p, _itr, resid):
+            window.append(float(resid))
+            bar.update(1)
+            postfix = {"obj": f"{float(resid):.4g}"}
+            if len(window) == window.maxlen:
+                rel_improvement = (max(window) - min(window)) / (abs(window[0]) + 1e-300)
+                postfix["d_obj"] = f"{rel_improvement:.2e}"
+            bar.set_postfix(postfix)
+
+    minner = Minimizer(objective, params, nan_policy="omit", iter_cb=iter_cb)
+    try:
+        result = minner.minimize(method=method, **fit_settings)
+    finally:
+        if progress:
+            bar.close()
+
+    best_fit = _compute_fit(result.params, measurement_settings)
+
+    return result, best_fit
 
 
 def _scale_penalty_settings(penalty_settings, weight_scale, cutoff_scale):
@@ -232,6 +255,7 @@ def chi2_vary_tikhonov(
     cutoff_scales,
     params_settings=None,
     fit_settings=None,
+    progress=False,
 ):
     """Scan Tikhonov weights and thresholds and return chi2 on a 2D grid.
 
@@ -258,28 +282,32 @@ def chi2_vary_tikhonov(
     -------
     chi2 : jnp.array, shape (len(weight_scales), len(cutoff_scales))
         Log likelihood (chi2) at the best-fit parameters for each grid point.
+    params_grid : list of list of dict
+        Fitted parameters from each fit, organized as params_grid[i][j]
+        contains the parameters dict for weight_scales[i], cutoff_scales[j].
     """
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
 
     chi2_grid = jnp.zeros((len(weight_scales), len(cutoff_scales)))
+    params_grid = [[None for _ in cutoff_scales] for _ in weight_scales]
+
     for i, ws in enumerate(weight_scales):
         for j, cs in enumerate(cutoff_scales):
             scaled = _scale_penalty_settings(penalty_settings, ws, cs)
-            result = run_fit(
+            result, best_fit = run_fit(
                 Pkl_data, Pkl_var, measurement_settings,
                 penalty_settings=scaled,
                 params_settings=params_settings,
                 fit_settings=fit_settings,
+                progress=progress,
             )
-            # Evaluate log likelihood only (no regularization) at best-fit params
-            chi2_val = float(_log_posterior(
-                result.params, Pkl_data, Pkl_var,
-                measurement_settings, penalty_settings=None, use_penalty=False,
-            ))
-            chi2_grid = chi2_grid.at[i, j].set(chi2_val)
 
-    return chi2_grid
+            chi2_val = _log_likelihood(best_fit, Pkl_data, Pkl_var)
+
+            chi2_grid = chi2_grid.at[i, j].set(chi2_val)
+            params_grid[i][j] = dict(result.params)
+    return chi2_grid, params_grid
 
 
 def build_params(Nelectrons, Nions, Nt, params_settings=None):

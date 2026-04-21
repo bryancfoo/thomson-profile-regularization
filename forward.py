@@ -149,7 +149,8 @@ def spectral_density(
         probe_vec,
         scatter_vec,
         ue_dir,
-        ui_dir
+        ui_dir,
+        notch=None,
 ):
     Nelectrons = jnp.shape(efract)[0]
     Nions = jnp.shape(ifract)[0]
@@ -167,8 +168,8 @@ def spectral_density(
     ifract = reshape_moments(ifract, Nions, Nt)
     ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
     ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
-    wavelengths = wavelengths[jnp.newaxis, jnp.newaxis, :]
-    return _spectral_density(
+    wavelengths_3d = wavelengths[jnp.newaxis, jnp.newaxis, :]
+    Skw = _spectral_density(
         n,
         ue,
         ui,
@@ -180,13 +181,20 @@ def spectral_density(
         ifract,
         ion_z,
         ion_a,
-        wavelengths,
+        wavelengths_3d,
         probe_wavelength,
         probe_vec,
         scatter_vec,
         ue_dir,
         ui_dir
     )
+
+    # Apply notch: NaN out wavelengths between notch[0] and notch[1]
+    if notch is not None:
+        mask = (wavelengths >= notch[0]) & (wavelengths <= notch[1])
+        Skw = jnp.where(mask[:, jnp.newaxis], jnp.nan, Skw)
+
+    return Skw
 
 
 
@@ -213,8 +221,9 @@ def _scattered_power_wavelength(
         ue_dir,
         ui_dir,
         instr_func_arr = None,
-        normalization_type = "integral",
-        normalization_scale = 1
+        normalization_type = "max",
+        normalization_scale = 1,
+        notch = None,
 ):
     Nelectrons = jnp.shape(efract)[0]
     Nions = jnp.shape(ifract)[0]
@@ -273,12 +282,19 @@ def _scattered_power_wavelength(
         # Not using 2D convolution to avoid time smearing
         Pklam = vmap(jnp.convolve, in_axes=1, out_axes=1)(Pklam, instr_func_arr, mode = "same")
 
-    #3 normalization options, based on setting the max, sum, or integral (dlambda) to 1
-    normalization = normalization_scale * ((normalization_type=="max") / jnp.max(Pklam, axis = 0)
-                                           + (normalization_type=="sum") / jnp.sum(Pklam, axis = 0)
-                                           + (normalization_type=="integral") / jnp.trapezoid(Pklam, wavelengths, axis = 0))
+    # Apply notch: NaN out wavelengths between notch[0] and notch[1]
+    if notch is not None:
+        mask = (wavelengths >= notch[0]) & (wavelengths <= notch[1])
+        Pklam = jnp.where(mask[:, jnp.newaxis], jnp.nan, Pklam)
 
-    Pklam /= normalization
+    #3 normalization options, based on setting the max, sum, or integral (dlambda) to 1
+    # nan-safe: for integral, replace NaNs with 0 before integrating (notch contributes nothing)
+    Pklam_finite = jnp.where(jnp.isnan(Pklam), 0.0, Pklam)
+    normalization = normalization_scale * ((normalization_type=="max") / jnp.nanmax(Pklam, axis = 0)
+                                           + (normalization_type=="sum") / jnp.nansum(Pklam, axis = 0)
+                                           + (normalization_type=="integral") / jnp.trapezoid(Pklam_finite, wavelengths, axis = 0))
+
+    Pklam *= normalization
 
 
 
