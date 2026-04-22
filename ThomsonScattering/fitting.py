@@ -1,8 +1,8 @@
 import jax.numpy as jnp
 from jax import jit
 from lmfit import Parameters, Minimizer
-from utility import extract_params_as_array
-from forward import _scattered_power_wavelength
+from .utility import extract_params_as_array
+from .forward import _scattered_power_wavelength
 from scipy.constants import c, k as kB, epsilon_0, e, m_p
 
 _jitted_scattered_power_wavelength = jit(_scattered_power_wavelength,
@@ -350,7 +350,13 @@ def build_params(Nelectrons, Nions, Nt, params_settings=None):
             user = params_settings[key_global]
         else:
             user = {}
-        return {**default, **user}
+        merged = {**default, **user}
+        if "expr" in merged:
+            expr = merged["expr"]
+            if "{t}" not in expr:
+                expr = expr + "_{t}"
+            merged["expr"] = expr.format(t=t)
+        return merged
 
     # total electron density time-series `n_{t}` (no species index)
     for t in range(Nt):
@@ -373,5 +379,3 @@ def build_params(Nelectrons, Nions, Nt, params_settings=None):
             p.add(f"ifract{s}_{t}", **_lookup("ifract", s, t, {"value": 1.0}))
 
     return p
-
-

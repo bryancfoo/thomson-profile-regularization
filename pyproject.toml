@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thomson-profile-regularization"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "jax",
+    "lmfit",
+    "scipy",
+    "matplotlib",
+    "numpy",
+    "h5py",
+    "interpax",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+ThomsonScattering = ["dispersion_tables.h5"]

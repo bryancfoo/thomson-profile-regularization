@@ -14,4 +14,3 @@ def plasma_frequency(n, z, a):
 
 def lam_Debye(ne, Te):
     return jnp.sqrt(epsilon_0 * Te / (ne * e**2))
-

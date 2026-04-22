@@ -1,11 +1,11 @@
 import jax.numpy as jnp
 from jax import vmap, jit
 from scipy.constants import c, m_e, m_p
-import plasma
-from dispersion import _Zprime
+from . import plasma
+from .dispersion import _Zprime
 from jax.scipy.special import gamma, gammaincc
 from jax.scipy.signal import convolve
-from utility import reshape_moments
+from .utility import reshape_moments
 import matplotlib.pyplot as plt
 
 
@@ -304,14 +304,3 @@ def _scattered_power_wavelength(
 def scattered_power_wavelength(*args, **kwargs):
 
     return _scattered_power_wavelength(*args, **kwargs)
-
-
-
-
-
-
-
-
-
-
-

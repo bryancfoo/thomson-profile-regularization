@@ -64,5 +64,3 @@ def add_params_from_array(params, var, value_array, settings):
     for i in range(Nvalues):
         params.add(var + f"_{i}", value=value_array[i], **settings[i])
     #params are mutable (I think) so no return is needed?
-
-

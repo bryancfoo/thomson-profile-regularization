@@ -1,3 +1,4 @@
+import os
 import jax.numpy as jnp
 import h5py
 import interpax
@@ -12,7 +13,8 @@ _p = jnp.linspace(2, 5, 2000)
 _zeta = jnp.linspace(0, 10, 2000)
 
 #Tabulated values
-with h5py.File('dispersion_tables.h5', 'r') as hf:
+_h5_path = os.path.join(os.path.dirname(__file__), 'dispersion_tables.h5')
+with h5py.File(_h5_path, 'r') as hf:
     _Zprime_real = jnp.array(hf["Zprime_real"])
     #_Zprime_imag = hf["Zprime_imag"]
 
@@ -68,13 +70,3 @@ def _Zprime(zeta, p, order = 8):
     Zprime_reshaped = jnp.reshape(Zprime_flat, zeta_shape_in)
 
     return Zprime_reshaped
-
-
-
-
-
-
-
-
-
-
