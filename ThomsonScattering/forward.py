@@ -280,7 +280,7 @@ def _scattered_power_wavelength(
         # Assuming a time-dependent instrument function, we use jax.vmap to apply the
         # relevant convolution to each time step
         # Not using 2D convolution to avoid time smearing
-        Pklam = vmap(jnp.convolve, in_axes=1, out_axes=1)(Pklam, instr_func_arr, mode = "same")
+        Pklam = vmap(lambda p, i: jnp.convolve(p, i, mode="same"), in_axes=1, out_axes=1)(Pklam, instr_func_arr)
 
     # Apply notch: NaN out wavelengths between notch[0] and notch[1]
     if notch is not None:
