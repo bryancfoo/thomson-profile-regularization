@@ -24,10 +24,7 @@ def reshape_moments(Q, Nions, Nt):
 
 #Pulls params out of a output.params object
 def extract_params_as_array(params, var, Nindices):
-    var_array = jnp.zeros(Nindices)
-    for i in range(Nindices):
-        var_array = var_array.at[i].set(params[f"{var}_{i}"])
-    return var_array
+    return jnp.asarray([params[f"{var}_{i}"].value for i in range(Nindices)])
 
 def extract_all_params_as_dict(params):
     """Extract all lmfit parameters into a dict of arrays, grouped by prefix.

@@ -90,25 +90,15 @@ def _compute_fit(params, measurement_settings):
 
     n = extract_params_as_array(params, "n", Nt)
 
-    Te = jnp.zeros((Nelectrons, Nt))
-    ue = jnp.zeros((Nelectrons, Nt))
-    pe = jnp.zeros((Nelectrons, Nt))
-    efract = jnp.zeros((Nelectrons, Nt))
-    for i in range(Nelectrons):
-        Te = Te.at[i, :].set(extract_params_as_array(params, f"Te{i}", Nt))
-        ue = ue.at[i, :].set(extract_params_as_array(params, f"ue{i}", Nt))
-        pe = pe.at[i, :].set(extract_params_as_array(params, f"pe{i}", Nt))
-        efract = efract.at[i, :].set(extract_params_as_array(params, f"efract{i}", Nt))
+    Te = jnp.stack([extract_params_as_array(params, f"Te{i}", Nt) for i in range(Nelectrons)])
+    ue = jnp.stack([extract_params_as_array(params, f"ue{i}", Nt) for i in range(Nelectrons)])
+    pe = jnp.stack([extract_params_as_array(params, f"pe{i}", Nt) for i in range(Nelectrons)])
+    efract = jnp.stack([extract_params_as_array(params, f"efract{i}", Nt) for i in range(Nelectrons)])
 
-    Ti = jnp.zeros((Nions, Nt))
-    ui = jnp.zeros((Nions, Nt))
-    pi = jnp.zeros((Nions, Nt))
-    ifract = jnp.zeros((Nions, Nt))
-    for i in range(Nions):
-        Ti = Ti.at[i, :].set(extract_params_as_array(params, f"Ti{i}", Nt))
-        ui = ui.at[i, :].set(extract_params_as_array(params, f"ui{i}", Nt))
-        pi = pi.at[i, :].set(extract_params_as_array(params, f"pi{i}", Nt))
-        ifract = ifract.at[i, :].set(extract_params_as_array(params, f"ifract{i}", Nt))
+    Ti = jnp.stack([extract_params_as_array(params, f"Ti{i}", Nt) for i in range(Nions)])
+    ui = jnp.stack([extract_params_as_array(params, f"ui{i}", Nt) for i in range(Nions)])
+    pi = jnp.stack([extract_params_as_array(params, f"pi{i}", Nt) for i in range(Nions)])
+    ifract = jnp.stack([extract_params_as_array(params, f"ifract{i}", Nt) for i in range(Nions)])
 
     return _jitted_scattered_power_wavelength(
         n=n * 1e6,

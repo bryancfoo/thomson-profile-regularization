@@ -26,47 +26,46 @@ _Zprime_real_interp = interpax.Interpolator2D(_zeta, _p, _Zprime_real)
 # and the supergaussian order p
 
 def _Zprime(zeta, p, order = 8):
-    zeta_shape_in = zeta.shape
+    # p stays at its natural (broadcastable) shape so p-only quantities
+    # are not redundantly evaluated along axes where p is constant.
 
-    #ravel the arrays or else interpax gets upset...
-    zeta = zeta.ravel()
-    p = p.ravel()
-    #print(jnp.shape(zeta), jnp.shape(p))
-
-    C = p / (2 * gamma(3 / p)) * (1 / 3 * gamma(5 / p) / gamma(3 / p)) ** (3 / 2)
-    A = (1 / 3 * gamma(5 / p) / gamma(3 / p)) ** (1 / 2)
+    g3 = gamma(3 / p)
+    g5 = gamma(5 / p)
+    A_inner = (1 / 3) * g5 / g3
+    A = jnp.sqrt(A_inner)
+    C = p / (2 * g3) * A_inner ** 1.5
 
     # Imaginary part can be written purely in terms of gamma functions:
     # Bryan note: my PACM report is *wrong*; the expression there for the imaginary part
     # is missing a factor of zeta (and maybe also sqrt2)!
     # Interestingly enough Fig. 5 in that is correct though...
 
-    Zprime_imag = jnp.sqrt(2) * zeta * jnp.pi * C * jnp.exp(-jnp.power(jnp.abs(A * zeta * jnp.sqrt(2)), p))
+    Az = A * zeta * jnp.sqrt(2)
+    abs_zeta = jnp.abs(zeta)
 
-    #Re(Zprime) is tabulated at small values of zeta:
-    Zprime_real_near = _Zprime_real_interp(jnp.abs(zeta), p)
+    Zprime_imag = jnp.sqrt(2) * zeta * jnp.pi * C * jnp.exp(-jnp.power(jnp.abs(Az), p))
+
+    #Re(Zprime) is tabulated at small values of zeta. Interpax requires same-shape
+    #ravelled inputs, so broadcast p only at this site.
+    out_shape = jnp.broadcast_shapes(zeta.shape, p.shape)
+    abs_zeta_b = jnp.broadcast_to(abs_zeta, out_shape)
+    p_b = jnp.broadcast_to(p, out_shape)
+    Zprime_real_near = _Zprime_real_interp(abs_zeta_b.ravel(), p_b.ravel()).reshape(out_shape)
 
     #for large zeta a Laurent expansion is used
     #the form of the Laurent expansion is apparently (from my year-old notes):
     #(2C/A) * sum_n [1/(A*zeta)**(2n+2) * (1/p) * gamma((2n+3)/p)]
     #How did I ever derive this???
 
-    #Build the array of n to sum over along a dimension which is 1 more than the dimension of zeta
-    #Should be compatible with making zeta, p the same size along different axes?
-    #n = jnp.ones(jnp.concatenate([jnp.ones(zeta.ndim), [int(order // 2)]]))
     n = jnp.arange(order // 2)
-    n = n[jnp.newaxis, :]
 
-    #now do another reshaping...
-
-    #compute the terms of the Laurent expansion
-    Zprime_real_far_expansion = 1 / jnp.power((A * zeta * jnp.sqrt(2))[:, jnp.newaxis], 2 * n + 1) * gamma((2 * n + 3) / p[:, jnp.newaxis])
+    #compute the terms of the Laurent expansion (n appended as trailing axis)
+    Zprime_real_far_expansion = 1 / jnp.power(Az[..., jnp.newaxis], 2 * n + 1) * gamma((2 * n + 3) / p[..., jnp.newaxis])
 
     Zprime_real_far = -2 * C / (A ** 2 * zeta * jnp.sqrt(2) * p) * jnp.sum(Zprime_real_far_expansion, axis = -1)
 
-    #Mask out the values of zeta in the wrong regimes and add the two regimes
-    Zprime_real = Zprime_real_far * (jnp.abs(zeta) > 10) + Zprime_real_near * (jnp.abs(zeta) <= 10)
-    Zprime_flat = (Zprime_real + 1.j * Zprime_imag)
-    Zprime_reshaped = jnp.reshape(Zprime_flat, zeta_shape_in)
+    # Use jnp.where (select) instead of mask-and-add — avoids NaN propagation
+    # from the far branch (which is inf at zeta=0) when masked out.
+    Zprime_real = jnp.where(abs_zeta > 10, Zprime_real_far, Zprime_real_near)
 
-    return Zprime_reshaped
+    return Zprime_real + 1.j * Zprime_imag

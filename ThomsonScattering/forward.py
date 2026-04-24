@@ -83,21 +83,35 @@ def _spectral_density(
     zetae = we / (k * vTe)
     zetai = wi / (k * vTi)
 
+    # Cache gamma evaluations on p — these were each computed at multiple call
+    # sites, and now also avoid the Nk-fold redundancy that the dropped
+    # jnp.repeat used to introduce inside _Zprime.
+    g3_pe = gamma(3 / pe)
+    g5_pe = gamma(5 / pe)
+    g2_pe = gamma(2 / pe)
+    ratio_pe = jnp.sqrt(2 / 3 * g5_pe / g3_pe)
+
+    g3_pi = gamma(3 / pi)
+    g5_pi = gamma(5 / pi)
+    g2_pi = gamma(2 / pi)
+    ratio_pi = jnp.sqrt(2 / 3 * g5_pi / g3_pi)
+
     #Also normalize to the characteristic velocity vp
-    xe = zetae * (jnp.sqrt(2 / 3 * gamma(5 / pe) / gamma(3 / pe)))
-    xi = zetai * (jnp.sqrt(2 / 3 * gamma(5 / pi) / gamma(3 / pi)))
+    xe = zetae * ratio_pe
+    xi = zetai * ratio_pi
 
-    # Calculate the susceptibilities
-    chiE = jnp.zeros([efract.size, w.size], dtype=jnp.complex64)
+    # Calculate the susceptibilities. _Zprime now broadcasts p against zeta
+    # internally, so we pass pe / pi at their natural shape.
     wpe = plasma.plasma_frequency(ne, 1, m_e / m_p)
-    chiE = 2 * wpe**2 / (vTe * k)**2 * _Zprime(zetae, jnp.repeat(pe, jnp.shape(zetae)[-1], axis = -1))
+    chiE = 2 * wpe**2 / (vTe * k)**2 * _Zprime(zetae, pe)
 
-    chiI = jnp.zeros([ifract.size, w.size], dtype=jnp.complex64)
     wpi = plasma.plasma_frequency(ni, ion_z, ion_a)
-    chiI = 2 * wpi ** 2 / (vTi * k) ** 2 * _Zprime(zetai, jnp.repeat(pi, jnp.shape(zetai)[-1], axis = -1))
+    chiI = 2 * wpi ** 2 / (vTi * k) ** 2 * _Zprime(zetai, pi)
 
     #longitudinal dielectric function
-    epsilon = 1 + jnp.sum(chiE, axis = 0) + jnp.sum(chiI, axis = 0)
+    sum_chiE = jnp.sum(chiE, axis = 0)
+    sum_chiI = jnp.sum(chiI, axis = 0)
+    epsilon = 1 + sum_chiE + sum_chiI
 
     #electron and ion contributions to Skw
     econtr = efract * (
@@ -105,11 +119,11 @@ def _spectral_density(
             * jnp.pi
             / k
             / vTe
-            / (2 * gamma(3 / pe))
-            * (jnp.sqrt(2 / 3 * gamma(5 / pe) / gamma(3 / pe)))
-            * jnp.power(jnp.abs(1 - jnp.sum(chiE, axis=0) / epsilon), 2)
+            / (2 * g3_pe)
+            * ratio_pe
+            * jnp.power(jnp.abs(1 - sum_chiE / epsilon), 2)
             * gammaincc(2 / pe, jnp.abs(xe) ** pe)
-            * gamma(2 / pe)
+            * g2_pe
     )
 
     icontr = ifract * (
@@ -118,11 +132,11 @@ def _spectral_density(
         * ion_z
         / k
         / vTi
-        / (2 * gamma(3 / pi))
-        * (jnp.sqrt(2 / 3 * gamma(5 / pi) / gamma(3 / pi)))
-        * jnp.power(jnp.abs(jnp.sum(chiE, axis=0) / epsilon), 2)
+        / (2 * g3_pi)
+        * ratio_pi
+        * jnp.power(jnp.abs(sum_chiE / epsilon), 2)
         * gammaincc(2 / pi, jnp.abs(xi) ** pi)
-        * gamma(2 / pi)
+        * g2_pi
     )
 
     Skw = jnp.real(jnp.sum(econtr, axis = 0)+jnp.sum(icontr, axis = 0))
