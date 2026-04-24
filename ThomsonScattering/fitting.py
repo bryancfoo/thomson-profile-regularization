@@ -151,6 +151,7 @@ def run_fit(
     penalty_settings=None,
     params_settings=None,
     fit_settings=None,
+    extra_params=None,
     progress=False,
 ):
     """Run the regularized Thomson scattering fit on a streak.
@@ -178,6 +179,12 @@ def run_fit(
         Optimizer settings. Supported keys:
           - 'method' (str, default 'nelder'): method string for lmfit Minimizer
           - any other keys are passed through as kwargs to Minimizer.minimize()
+    extra_params : list of dict or None
+        Extra parameters to inject into the fitting (e.g. dummy variables for expr constraints).
+        Each dict must have a "name" key, plus any valid lmfit.Parameters.add() kwargs.
+        The parameter will be replicated across all Nt time slices as {name}_0, {name}_1, etc.
+        If an "expr" string is provided, {t} substitution is applied: if {t} is not present,
+        _{t} is appended before calling .format(t=t).
     progress : bool
         If True, display a tqdm progress bar updated each iteration showing
         the current objective value.
@@ -200,6 +207,26 @@ def run_fit(
     Nt = jnp.shape(Pkl_data)[1]
 
     params = build_params(Nelectrons, Nions, Nt, params_settings)
+
+    # Add extra parameters if provided
+    if extra_params is not None:
+        for extra_def in extra_params:
+            # Extract the "name" key and other lmfit.Parameters.add() kwargs
+            extra_def_copy = dict(extra_def)
+            param_name = extra_def_copy.pop("name")
+
+            # Replicate across all time slices
+            for t in range(Nt):
+                # Apply {t} substitution to expr if present
+                kwargs = dict(extra_def_copy)
+                if "expr" in kwargs:
+                    expr = kwargs["expr"]
+                    if "{t}" not in expr:
+                        expr = expr + "_{t}"
+                    kwargs["expr"] = expr.format(t=t)
+
+                # Add the parameter
+                params.add(f"{param_name}_{t}", **kwargs)
 
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
@@ -255,6 +282,7 @@ def chi2_vary_tikhonov(
     cutoff_scales,
     params_settings=None,
     fit_settings=None,
+    extra_params=None,
     progress=False,
 ):
     """Scan Tikhonov weights and thresholds and return chi2 on a 2D grid.
@@ -269,7 +297,7 @@ def chi2_vary_tikhonov(
 
     Parameters
     ----------
-    Pkl_data, Pkl_var, measurement_settings, params_settings, fit_settings :
+    Pkl_data, Pkl_var, measurement_settings, params_settings, fit_settings, extra_params :
         Same as run_fit.
     penalty_settings : dict
         Base penalty settings (must not be None).
@@ -300,6 +328,7 @@ def chi2_vary_tikhonov(
                 penalty_settings=scaled,
                 params_settings=params_settings,
                 fit_settings=fit_settings,
+                extra_params=extra_params,
                 progress=progress,
             )
 
