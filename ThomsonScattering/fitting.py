@@ -206,9 +206,8 @@ def run_fit(
     Nions = len(measurement_settings["ion_z"])
     Nt = jnp.shape(Pkl_data)[1]
 
-    params = build_params(Nelectrons, Nions, Nt, params_settings)
-
-    # Add extra parameters if provided
+    # Create params and add extra parameters first (before main params)
+    params = Parameters()
     if extra_params is not None:
         for extra_def in extra_params:
             # Extract the "name" key and other lmfit.Parameters.add() kwargs
@@ -227,6 +226,11 @@ def run_fit(
 
                 # Add the parameter
                 params.add(f"{param_name}_{t}", **kwargs)
+
+    # Build and add main parameters
+    main_params = build_params(Nelectrons, Nions, Nt, params_settings)
+    for key, val in main_params.items():
+        params[key] = val
 
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
