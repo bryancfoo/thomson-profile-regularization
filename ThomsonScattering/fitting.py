@@ -233,15 +233,17 @@ def run_fit(
         from tqdm.auto import tqdm
         from collections import deque
         bar = tqdm(desc=f"run_fit ({method})", unit="iter")
-        window = deque(maxlen=50)
+        window = deque(maxlen=100)
 
         def iter_cb(_p, _itr, resid):
             window.append(float(resid))
             bar.update(1)
             postfix = {"obj": f"{float(resid):.4g}"}
             if len(window) == window.maxlen:
-                rel_improvement = (max(window) - min(window)) / (abs(window[0]) + 1e-300)
-                postfix["d_obj"] = f"{rel_improvement:.2e}"
+                abs_improvement = window[0] - min(window)
+                rel_improvement = abs_improvement / (abs(window[0]) + 1e-300)
+                postfix["d_obj"] = f"{abs_improvement:.2e}"
+                postfix["d_obj_rel"] = f"{rel_improvement:.2e}"
             bar.set_postfix(postfix)
 
     minner = Minimizer(objective, params, nan_policy="omit", iter_cb=iter_cb)
