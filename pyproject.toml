@@ -14,6 +14,9 @@ dependencies = [
     "numpy",
     "h5py",
     "interpax",
+    "optax",
+    "tqdm",
+    "tomli >= 2.0; python_version < '3.11'",
 ]
 
 [tool.setuptools.packages.find]

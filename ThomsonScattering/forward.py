@@ -1,12 +1,27 @@
+from typing import NamedTuple
+
 import jax.numpy as jnp
 from jax import vmap, jit
 from scipy.constants import c, m_e, m_p
 from . import plasma
+from . import gain as _gain
 from .dispersion import _Zprime
 from jax.scipy.special import gamma, gammaincc
 from jax.scipy.signal import convolve
 from .utility import reshape_moments
 import matplotlib.pyplot as plt
+
+
+# Bundle of intermediates returned by `_spectral_density`. The susceptibilities
+# and dielectric are kept on the same (Nk, Nt) grid as Skw so the gain
+# correction can reuse them without recomputing _Zprime.
+class SpectralDensityOut(NamedTuple):
+    Skw: jnp.ndarray       # (Nk, Nt) real
+    sum_chiE: jnp.ndarray  # (Nk, Nt) complex
+    sum_chiI: jnp.ndarray  # (Nk, Nt) complex
+    epsilon: jnp.ndarray   # (Nk, Nt) complex
+    k: jnp.ndarray         # (Nk, Nt) real, fluctuation wavenumber
+    ks: jnp.ndarray        # (Nk, Nt) real, scattered-light wavenumber
 
 
 # Relevant normalization units are:
@@ -141,7 +156,16 @@ def _spectral_density(
 
     Skw = jnp.real(jnp.sum(econtr, axis = 0)+jnp.sum(icontr, axis = 0))
 
-    return Skw.T
+    # k, ks come in with a leading singleton (1, Nt, Nk); strip it so all
+    # returned arrays share the (Nk, Nt) orientation of Skw.T.
+    return SpectralDensityOut(
+        Skw=Skw.T,
+        sum_chiE=sum_chiE.T,
+        sum_chiI=sum_chiI.T,
+        epsilon=epsilon.T,
+        k=k[0].T,
+        ks=ks[0].T,
+    )
 
 # This is the user-facing function. It takes regular sized inputs and reshapes them as needed
 # to be used in _spectral_density
@@ -183,7 +207,7 @@ def spectral_density(
     ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
     ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
     wavelengths_3d = wavelengths[jnp.newaxis, jnp.newaxis, :]
-    Skw = _spectral_density(
+    out = _spectral_density(
         n,
         ue,
         ui,
@@ -202,6 +226,7 @@ def spectral_density(
         ue_dir,
         ui_dir
     )
+    Skw = out.Skw
 
     # Apply notch: NaN out wavelengths between notch[0] and notch[1]
     if notch is not None:
@@ -235,9 +260,17 @@ def _scattered_power_wavelength(
         ue_dir,
         ui_dir,
         instr_func_arr = None,
+        irf_normalization = "area",
+        throughput = None,
+        aperture_weights = None,
+        background_coefs = None,
         normalization_type = "max",
         normalization_scale = 1,
         notch = None,
+        probe_intensity = 0.0,
+        probe_diameter = 1.0,
+        pol_p_fraction = 1.0,
+        gain_mode = "off",
 ):
     Nelectrons = jnp.shape(efract)[0]
     Nions = jnp.shape(ifract)[0]
@@ -255,25 +288,53 @@ def _scattered_power_wavelength(
     ifract = reshape_moments(ifract, Nions, Nt)
     ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
     ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
-    Skw = _spectral_density(
-        n,
-        ue,
-        ui,
-        Te,
-        Ti,
-        pe,
-        pi,
-        efract,
-        ifract,
-        ion_z,
-        ion_a,
-        wavelengths[jnp.newaxis, jnp.newaxis, :],
-        probe_wavelength,
-        probe_vec,
-        scatter_vec,
-        ue_dir,
-        ui_dir
-    )
+
+    # Promote scatter_vec to (Nangles, 3); a single (3,) becomes (1, 3).
+    # Aperture-averaged spectrum: vmap _spectral_density over the angle axis,
+    # then weighted-sum with aperture_weights.
+    scatter_vec_arr = jnp.atleast_2d(scatter_vec)
+    if aperture_weights is None:
+        weights = jnp.ones(scatter_vec_arr.shape[0]) / scatter_vec_arr.shape[0]
+    else:
+        weights = jnp.asarray(aperture_weights)
+
+    def _skw_one(svec):
+        out = _spectral_density(
+            n,
+            ue,
+            ui,
+            Te,
+            Ti,
+            pe,
+            pi,
+            efract,
+            ifract,
+            ion_z,
+            ion_a,
+            wavelengths[jnp.newaxis, jnp.newaxis, :],
+            probe_wavelength,
+            probe_vec,
+            svec,
+            ue_dir,
+            ui_dir,
+        )
+        # Apply Turnbull et al. (PRL 2026) SRS/SBS gain correction per ray.
+        # Each aperture-averaged scatter angle sees its own theta_s, so L and
+        # the cos^2 polarization factor are computed inside this vmap branch.
+        scattering_angle = jnp.arccos(jnp.dot(probe_vec, svec))
+        G = _gain.gain_factor(
+            out.sum_chiE, out.sum_chiI, out.epsilon, out.k, out.ks,
+            scattering_angle=scattering_angle,
+            probe_wavelength=probe_wavelength,
+            probe_intensity=probe_intensity,
+            probe_diameter=probe_diameter,
+            pol_p_fraction=pol_p_fraction,
+            mode=gain_mode,
+        )
+        return out.Skw * G
+
+    Skw_stack = vmap(_skw_one)(scatter_vec_arr)  # (Nangles, Nk, Nt)
+    Skw = jnp.tensordot(weights, Skw_stack, axes=1)  # (Nk, Nt)
 
     #Convert to wavelength space
     #Correction by dw/d(lambda) ~ lambda**(-2)
@@ -288,6 +349,11 @@ def _scattered_power_wavelength(
 
     Pklam = Sklam * (1 + 2 * w / wl)
 
+    # Apply wavelength-dependent throughput (spectrometer transmission/sensitivity)
+    # before the IRF: throughput modulates the true signal, then the IRF smears it.
+    if throughput is not None:
+        Pklam = Pklam * throughput[:, jnp.newaxis]
+
     # Here I assume that the instrument function is applied to the scattered power
     # and not to Skw, which I think is what the file I get from Joe Katz does...
     if instr_func_arr is not None:
@@ -295,20 +361,40 @@ def _scattered_power_wavelength(
         # relevant convolution to each time step
         # Not using 2D convolution to avoid time smearing
         Pklam = vmap(lambda p, i: jnp.convolve(p, i, mode="same"), in_axes=1, out_axes=1)(Pklam, instr_func_arr)
+        # Renormalize so amplitude isn't coupled to PSF area / peak.
+        if irf_normalization == "area":
+            Pklam = Pklam / jnp.sum(instr_func_arr, axis=0, keepdims=True)
+        elif irf_normalization == "peak":
+            Pklam = Pklam / jnp.max(instr_func_arr, axis=0, keepdims=True)
+        # "none" leaves Pklam unscaled.
 
     # Apply notch: NaN out wavelengths between notch[0] and notch[1]
     if notch is not None:
         mask = (wavelengths >= notch[0]) & (wavelengths <= notch[1])
         Pklam = jnp.where(mask[:, jnp.newaxis], jnp.nan, Pklam)
 
-    #3 normalization options, based on setting the max, sum, or integral (dlambda) to 1
-    # nan-safe: for integral, replace NaNs with 0 before integrating (notch contributes nothing)
-    Pklam_finite = jnp.where(jnp.isnan(Pklam), 0.0, Pklam)
-    normalization = normalization_scale * ((normalization_type=="max") / jnp.nanmax(Pklam, axis = 0)
-                                           + (normalization_type=="sum") / jnp.nansum(Pklam, axis = 0)
-                                           + (normalization_type=="integral") / jnp.trapezoid(Pklam_finite, wavelengths, axis = 0))
+    # Polynomial background in centered+scaled wavelength.
+    # background_coefs has shape (K+1, Nt); coef i is the (lam-lam0)/lam0 ** i term.
+    # Added after notch (so the notched region stays NaN) and before normalization
+    # (so signal+bg get normalized together, matching how data is processed).
+    if background_coefs is not None:
+        K_plus_1 = background_coefs.shape[0]
+        lam_norm = (wavelengths - probe_wavelength) / probe_wavelength
+        i_arr = jnp.arange(K_plus_1)
+        powers = lam_norm[:, jnp.newaxis] ** i_arr[jnp.newaxis, :]  # (Nk, K+1)
+        Pklam = Pklam + powers @ background_coefs  # (Nk, Nt)
 
-    Pklam *= normalization
+    # normalization_type is a static arg under jit, so branching here is
+    # compile-time: only the selected reduction is traced.
+    if normalization_type == "max":
+        norm = normalization_scale / jnp.nanmax(Pklam, axis=0)
+    elif normalization_type == "sum":
+        norm = normalization_scale / jnp.nansum(Pklam, axis=0)
+    else:  # "integral"
+        Pklam_finite = jnp.where(jnp.isnan(Pklam), 0.0, Pklam)
+        norm = normalization_scale / jnp.trapezoid(Pklam_finite, wavelengths, axis=0)
+
+    Pklam = Pklam * norm
 
 
 

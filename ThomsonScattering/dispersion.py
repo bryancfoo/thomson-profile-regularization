@@ -43,7 +43,7 @@ def _Zprime(zeta, p, order = 8):
     Az = A * zeta * jnp.sqrt(2)
     abs_zeta = jnp.abs(zeta)
 
-    Zprime_imag = jnp.sqrt(2) * zeta * jnp.pi * C * jnp.exp(-jnp.power(jnp.abs(Az), p))
+    Zprime_imag = -jnp.sqrt(2) * zeta * jnp.pi * C * jnp.exp(-jnp.power(jnp.abs(Az), p))
 
     #Re(Zprime) is tabulated at small values of zeta. Interpax requires same-shape
     #ravelled inputs, so broadcast p only at this site.
