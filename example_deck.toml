@@ -18,14 +18,33 @@
 #                                     wavelengths = "file.csv"
 # Paths are resolved relative to this deck file.
 #
-# Initial-value warm start from a prior fit:
+# Initial-value warm start from a prior fit (same time axis):
 #   [params.Te0]
 #   value = "prev_result.h5:Te0"   # (Nt,) array — one value per time step
 #   min = 10.0
 #   max = 5000.0
 #   vary = true
 #
-# Constrained ion fractions with a dummy free parameter:
+# Cross-time-axis warm start (e.g. EPW result → IAW fit on a different time grid):
+#   [data]
+#   time_axis = "new_data.h5:time"          # (Nt,) fit time axis — required for interpolation
+#
+#   [params.Te0]
+#   value            = "epw_result.h5:Te0"  # (Nt_src,) array on source time grid
+#   source_time_axis = "epw_result.h5:time" # (Nt_src,) — triggers linear interpolation onto fit time axis
+#   min = 10.0
+#   max = 5000.0
+#   vary = true
+#
+# Relative bounds — bounds that scale with each time step's value:
+#   [params.Te0]
+#   value   = "epw_result.h5:Te0"
+#   rel_min = -0.10   # min = value * 0.90  (per time step)
+#   rel_max = +0.10   # max = value * 1.10  (per time step)
+#   vary = true
+#
+# Constrained ion fractions with a dummy free parameter — legacy lmfit-only
+# form using per-time {t} substitution inside [params.X]:
 #   [[extra_params]]
 #   name = "ifract1_dummy"
 #   value = 0.2
@@ -36,6 +55,31 @@
 #   [params.ifract1]
 #   expr = "min(1 - ifract0_{t}, ifract1_dummy_{t})"
 #   (requires backend = "lmfit")
+#
+# Backend-agnostic constraint section — works for both lmfit and grad. Keys
+# are parameter prefixes; values are expressions written in terms of OTHER
+# prefixes (no _{t} suffix — substitution is automatic). Available functions:
+# min, max, abs, where, clip, sqrt, exp, log, plus arithmetic.
+#
+#   [[extra_params]]
+#   name = "ifract1_dummy"
+#   value = 0.2
+#   min = 0.0
+#   max = 1.0
+#   vary = true
+#
+#   [[extra_params]]
+#   name = "ui1_dummy"
+#   value = 0.0
+#   min = -5e5
+#   max = 5e5
+#   vary = true
+#
+#   [constraints]
+#   Ti2     = "Ti1"                                    # equality coupling
+#   ifract1 = "min(1 - ifract0, ifract1_dummy)"        # sum-to-1 with dummy clamp
+#   ifract5 = "1 - ifract0 - ifract1 - ifract2 - ifract3 - ifract4"
+#   ui1     = "max(ui1_dummy, ui0)"                    # ordering: ui1 >= ui0
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Data ──────────────────────────────────────────────────────────────────────

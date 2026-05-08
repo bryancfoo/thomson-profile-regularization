@@ -2,15 +2,15 @@
 
 Usage
 -----
-    python fit_from_deck.py
+    fit-from-deck path/to/deck.toml      # after `pip install -e .`
+    python fit_from_deck.py path/to/deck.toml
+    python fit_from_deck.py              # falls back to interactive prompt
 
-The script prompts for the path to a ``.toml`` deck file, reads all
-measurement geometry, penalty, parameter, and optimizer settings from it,
-runs the fit, and writes results to an HDF5 file.
-
+The deck file's directory is the base for all relative paths it references.
 See ``example_deck.toml`` for the full deck schema with inline documentation.
 """
 
+import sys
 from pathlib import Path
 
 from ThomsonScattering.utility import (
@@ -21,8 +21,14 @@ from ThomsonScattering.utility import (
 from ThomsonScattering.fitting import run_fit, run_fit_grad
 
 
-def main():
-    deck_path = Path(input("Path to input deck (.toml): ").strip()).expanduser().resolve()
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        raw = argv[0]
+    else:
+        raw = input("Path to input deck (.toml): ").strip()
+    deck_path = Path(raw).expanduser().resolve()
 
     if not deck_path.exists():
         raise FileNotFoundError(f"Deck file not found: {deck_path}")
@@ -33,7 +39,7 @@ def main():
     (
         Pkl_data, Pkl_var,
         meas, pen, pars, fit_kw,
-        extras, out_path, backend,
+        extras, constraints, out_path, backend,
     ) = build_settings_from_deck(deck)
 
     print(f"\nRunning fit  backend={backend!r}  Nt={Pkl_data.shape[1]}  Nk={Pkl_data.shape[0]}")
@@ -45,6 +51,7 @@ def main():
             params_settings=pars,
             fit_settings=fit_kw,
             extra_params=extras,
+            constraints=constraints,
             progress=True,
         )
         loss    = float(result.residual) if not hasattr(result.residual, "__len__") else float("nan")
@@ -53,17 +60,13 @@ def main():
         msg     = getattr(result, "message", "")
         print(f"\nloss={loss:.6g}  nfev={neval}  success={success}  message={msg!r}")
     else:
-        if extras:
-            import warnings
-            warnings.warn(
-                "extra_params are not supported with backend='grad' and will be ignored.",
-                stacklevel=2,
-            )
         result, best_fit = run_fit_grad(
             Pkl_data, Pkl_var, meas,
             penalty_settings=pen,
             params_settings=pars,
             fit_settings=fit_kw,
+            extra_params=extras,
+            constraints=constraints,
             progress=True,
         )
         print(f"\nloss={result.fun:.6g}  nit={result.nit}  success={result.success}")

@@ -171,6 +171,9 @@ def build_settings_from_deck(deck):
     params_settings     : dict or None
     fit_settings        : dict  (``backend`` key already removed)
     extra_params        : list of dict or None
+    constraints_settings : dict[str, str] or None
+        Mapping of parameter prefix → expression string from the deck's
+        ``[constraints]`` table. Same string drives both backends.
     output_path         : pathlib.Path
     backend             : str  ``"lmfit"`` or ``"grad"``
     """
@@ -183,6 +186,17 @@ def build_settings_from_deck(deck):
     Pkl_data = _load_h5_dataset(h5_path, data_sec["pkl_dataset"])
     Pkl_var  = _load_h5_dataset(h5_path, data_sec["var_dataset"])
     Nt = Pkl_data.shape[1]
+
+    # Optional: authoritative time axis for this fit — required when any param
+    # uses source_time_axis for cross-time-axis interpolation.
+    fit_time_axis = None
+    if "time_axis" in data_sec:
+        fit_time_axis = _load_array(data_sec["time_axis"], base_dir)
+        if fit_time_axis.ndim != 1 or len(fit_time_axis) != Nt:
+            raise ValueError(
+                f"[data] time_axis has shape {fit_time_axis.shape}; "
+                f"expected ({Nt},) to match Pkl_data time dimension."
+            )
 
     # ── 2. Build measurement_settings ───────────────────────────────────────
     meas_raw = deck.get("measurement", {})
@@ -242,16 +256,41 @@ def build_settings_from_deck(deck):
         val = kw.get("value")
         if isinstance(val, str):
             arr = _load_array(val, base_dir)
-            if arr.ndim != 1 or len(arr) != Nt:
+            src_time_key = "source_time_axis"
+            _strip = {"value", src_time_key, "rel_min", "rel_max"}
+            other = {k: v for k, v in kw.items() if k not in _strip}
+            rel_min = kw.get("rel_min")
+            rel_max = kw.get("rel_max")
+            if src_time_key in kw:
+                if fit_time_axis is None:
+                    raise ValueError(
+                        f"[params.{key}] specifies source_time_axis but [data] has no "
+                        "'time_axis' field. Add 'time_axis = \"file.h5:time\"' to [data]."
+                    )
+                src_time = _load_array(kw[src_time_key], base_dir)
+                arr = _np.interp(fit_time_axis, src_time, arr)
+            elif arr.ndim != 1 or len(arr) != Nt:
                 raise ValueError(
                     f"[params.{key}] value array has shape {arr.shape}; "
                     f"expected ({Nt},) to match Pkl_data time dimension."
                 )
-            other = {k: v for k, v in kw.items() if k != "value"}
             for t in range(Nt):
-                params_settings[f"{key}_{t}"] = {"value": float(arr[t]), **other}
+                v = float(arr[t])
+                entry = {"value": v, **other}
+                if rel_min is not None:
+                    entry["min"] = v * (1 + rel_min)
+                if rel_max is not None:
+                    entry["max"] = v * (1 + rel_max)
+                params_settings[f"{key}_{t}"] = entry
         else:
-            params_settings[key] = dict(kw)
+            ps = dict(kw)
+            v = ps.get("value")
+            if isinstance(v, (int, float)):
+                if "rel_min" in ps:
+                    ps["min"] = float(v) * (1 + ps.pop("rel_min"))
+                if "rel_max" in ps:
+                    ps["max"] = float(v) * (1 + ps.pop("rel_max"))
+            params_settings[key] = ps
 
     # Pass 2: explicit per-time overrides win over expansion (most specific)
     for key, kw in params_raw.items():
@@ -270,7 +309,13 @@ def build_settings_from_deck(deck):
         penalty_settings[prefix] = ps
     penalty_settings = penalty_settings or None
 
-    # ── 5. Fit settings, extra_params, output path ───────────────────────────
+    # ── 5. Constraints (string expressions; both backends compile their own) ─
+    constraints_raw = deck.get("constraints", {})
+    constraints_settings = {
+        str(k): str(v) for k, v in constraints_raw.items()
+    } if constraints_raw else None
+
+    # ── 6. Fit settings, extra_params, output path ───────────────────────────
     extra_params = deck.get("extra_params", None)
 
     fit_raw = dict(deck.get("fit", {}))
@@ -296,6 +341,7 @@ def build_settings_from_deck(deck):
         params_settings,
         fit_settings,
         extra_params,
+        constraints_settings,
         output_path,
         backend,
     )

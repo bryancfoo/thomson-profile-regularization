@@ -1,9 +1,50 @@
+import re
 import jax.numpy as jnp
 from jax import jit
 from lmfit import Parameters, Minimizer
 from .utility import extract_params_as_array
 from .forward import _scattered_power_wavelength
 from scipy.constants import c, k as kB, epsilon_0, e, m_p
+
+
+# Namespace exposed to constraint expressions evaluated in the grad backend.
+# `min` / `max` are the binary jnp variants — they match the 2-arg form used
+# in lmfit `expr=` strings, so the same expression text works for both backends.
+_CONSTRAINT_NS = {
+    "min": jnp.minimum, "max": jnp.maximum,
+    "abs": jnp.abs, "where": jnp.where, "clip": jnp.clip,
+    "sqrt": jnp.sqrt, "exp": jnp.exp, "log": jnp.log,
+    "__builtins__": {},
+}
+
+
+def _compile_grad_constraints(constraints):
+    """Convert {prefix: str} into {prefix: callable(p) -> (Nt,) array}.
+
+    Pure-callable entries are passed through unchanged so existing Python-API
+    callers keep working.
+    """
+    compiled = {}
+    for prefix, spec in constraints.items():
+        if callable(spec):
+            compiled[prefix] = spec
+        elif isinstance(spec, str):
+            code = compile(spec, f"<constraint:{prefix}>", "eval")
+            def _fn(p, _code=code, _prefix=prefix):
+                try:
+                    return eval(_code, _CONSTRAINT_NS, p)
+                except NameError as nerr:
+                    raise NameError(
+                        f"Constraint for {_prefix!r} references unknown name "
+                        f"({nerr}). Available names: {sorted(p)}"
+                    ) from None
+            compiled[prefix] = _fn
+        else:
+            raise TypeError(
+                f"Constraint for {prefix!r} must be a str or callable, "
+                f"got {type(spec).__name__}"
+            )
+    return compiled
 
 _jitted_scattered_power_wavelength = jit(_scattered_power_wavelength,
                                          static_argnames=('normalization_type', 'notch', 'irf_normalization', 'gain_mode'))
@@ -167,6 +208,7 @@ def run_fit(
     params_settings=None,
     fit_settings=None,
     extra_params=None,
+    constraints=None,
     progress=False,
 ):
     """Run the regularized Thomson scattering fit on a streak.
@@ -200,6 +242,13 @@ def run_fit(
         The parameter will be replicated across all Nt time slices as {name}_0, {name}_1, etc.
         If an "expr" string is provided, {t} substitution is applied: if {t} is not present,
         _{t} is appended before calling .format(t=t).
+    constraints : dict or None
+        Mapping of parameter prefix (e.g. ``"ifract1"``) to a string expression
+        written in terms of other prefix names (no ``_{t}`` suffix). Each entry
+        is replicated across all Nt time slices: prefix names in the expression
+        are rewritten to their per-time form before being assigned to the
+        target parameter's ``expr`` attribute. Same syntax as ``run_fit_grad``,
+        so a deck's ``[constraints]`` section drives both backends.
     progress : bool
         If True, display a tqdm progress bar updated each iteration showing
         the current objective value.
@@ -249,6 +298,29 @@ def run_fit(
     )
     for key, val in main_params.items():
         params[key] = val
+
+    # Apply [constraints] by rewriting bare prefix names to their per-time form
+    # and assigning to the target parameter's expr. Done after extras + main
+    # params are registered so expressions may reference either.
+    if constraints:
+        known_prefixes = {k.rsplit("_", 1)[0] for k in params.keys()}
+        # Sort longest-first so e.g. "ifract10" matches before "ifract1".
+        prefix_pat = re.compile(
+            r"\b(" + "|".join(
+                re.escape(p) for p in sorted(known_prefixes, key=len, reverse=True)
+            ) + r")\b"
+        )
+        for prefix, expr in constraints.items():
+            for t in range(Nt):
+                target = f"{prefix}_{t}"
+                if target not in params:
+                    raise KeyError(
+                        f"[constraints] target {target!r} not found in params. "
+                        f"Constraint prefix {prefix!r} must match a known parameter."
+                    )
+                params[target].expr = prefix_pat.sub(
+                    lambda m, _t=t: f"{m.group(1)}_{_t}", expr
+                )
 
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
@@ -452,6 +524,7 @@ def run_fit_grad(
     penalty_settings=None,
     params_settings=None,
     constraints=None,
+    extra_params=None,
     fit_settings=None,
     progress=False,
 ):
@@ -472,19 +545,28 @@ def run_fit_grad(
         Same semantics as run_fit.
     constraints : dict or None
         Equality-style reparameterization. Keys are parameter prefixes (e.g.
-        "ifract1"); values are callables that receive a dict p of
-        {prefix: (Nt,) array} of all already-assembled parameters and return
-        a (Nt,) array. Constrained prefixes are excluded from the free-variable
-        vector x. Evaluated in insertion order, so a lambda may reference any
-        prefix assembled before it.
+        "ifract1"); values are EITHER:
+          - a string expression evaluated against (Nt,) jnp arrays, with names
+            ``min``, ``max``, ``abs``, ``where``, ``clip``, ``sqrt``, ``exp``,
+            ``log`` available — same expression text works for the lmfit backend.
+          - a callable receiving the accumulated dict p of {prefix: (Nt,) array}
+            and returning a (Nt,) array.
+        Constrained prefixes are excluded from the free-variable vector x and
+        are evaluated after all other prefixes (and any extra_params) are
+        assembled, so expressions may reference any of them by name.
 
         Example::
 
             constraints = {
-                "ifract1": lambda p: 1.0 - p["ifract0"],
+                "ifract1": "1 - ifract0",
                 "ue1":     lambda p: -p["ue0"],
+                "ifract2": "min(1 - ifract0 - ifract1, ifract2_dummy)",
             }
-
+    extra_params : list of dict or None
+        Free dummy parameters injected into the fit. Each dict needs a "name"
+        key plus any lmfit add() kwargs (value, min, max, vary). Replicated as
+        ``{name}_0, {name}_1, ...`` across Nt time steps and made available to
+        constraint expressions under the bare name (e.g. ``ifract1_dummy``).
     fit_settings : dict or None
         Optimizer settings. Recognized keys:
           - 'optimizer' (str, default 'lbfgs'): 'lbfgs' | 'adam' | 'adamw'
@@ -541,11 +623,30 @@ def run_fit_grad(
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
 
-    _constraints = constraints or {}
     params = build_params(
         Nelectrons, Nions, Nt, params_settings,
         background_order=background_order,
     )
+
+    # Inject extra dummy parameters (replicated across time slices) so they
+    # behave like ordinary free variables and can be referenced by name in
+    # constraint expressions (e.g. ``ifract1_dummy``).
+    _extra_prefixes = []
+    if extra_params is not None:
+        for extra_def in extra_params:
+            extra_def_copy = dict(extra_def)
+            param_name = extra_def_copy.pop("name")
+            _extra_prefixes.append(param_name)
+            for t in range(Nt):
+                kwargs = dict(extra_def_copy)
+                if "expr" in kwargs:
+                    expr = kwargs["expr"]
+                    if "{t}" not in expr:
+                        expr = expr + "_{t}"
+                    kwargs["expr"] = expr.format(t=t)
+                params.add(f"{param_name}_{t}", **kwargs)
+
+    _constraints = _compile_grad_constraints(constraints) if constraints else {}
 
     def _prefix_of(key):
         return key.rsplit("_", 1)[0]
@@ -595,6 +696,14 @@ def run_fit_grad(
         # p accumulates {prefix: (Nt,) array} so constraint lambdas can
         # reference previously assembled parameters by name.
         p = {}
+
+        # Assemble extra (dummy) parameters first so constraints can reference
+        # them by their bare name regardless of where the constraint sits in
+        # the standard prefix order.
+        for extra_prefix in _extra_prefixes:
+            p[extra_prefix] = jnp.stack(
+                [_get(x, f"{extra_prefix}_{t}") for t in range(Nt)]
+            )
 
         def _row(base, s):
             prefix = base if base == "n" else f"{base}{s}"
