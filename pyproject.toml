@@ -19,8 +19,14 @@ dependencies = [
     "tomli >= 2.0; python_version < '3.11'",
 ]
 
+[project.scripts]
+fit-from-deck = "fit_from_deck:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools]
+py-modules = ["fit_from_deck"]
 
 [tool.setuptools.package-data]
 ThomsonScattering = ["dispersion_tables.h5"]
