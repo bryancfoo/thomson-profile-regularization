@@ -117,11 +117,13 @@ def _spectral_density(
 
     # Calculate the susceptibilities. _Zprime now broadcasts p against zeta
     # internally, so we pass pe / pi at their natural shape.
-    wpe = plasma.plasma_frequency(ne, 1, m_e / m_p)
-    chiE = 2 * wpe**2 / (vTe * k)**2 * _Zprime(zetae, pe)
+    # Use plasma_frequency_sq (no sqrt) so the gradient is finite when n=0.
+    # sqrt(0) has an infinite gradient; squaring it back gives 0*inf = NaN in VJP.
+    wpe_sq = plasma.plasma_frequency_sq(ne, 1, m_e / m_p)
+    chiE = 2 * wpe_sq / (vTe * k)**2 * _Zprime(zetae, pe)
 
-    wpi = plasma.plasma_frequency(ni, ion_z, ion_a)
-    chiI = 2 * wpi ** 2 / (vTi * k) ** 2 * _Zprime(zetai, pi)
+    wpi_sq = plasma.plasma_frequency_sq(ni, ion_z, ion_a)
+    chiI = 2 * wpi_sq / (vTi * k) ** 2 * _Zprime(zetai, pi)
 
     #longitudinal dielectric function
     sum_chiE = jnp.sum(chiE, axis = 0)

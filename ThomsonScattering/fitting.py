@@ -280,15 +280,18 @@ def run_fit(
 
             # Replicate across all time slices
             for t in range(Nt):
-                # Apply {t} substitution to expr if present
-                kwargs = dict(extra_def_copy)
+                # Index into array-valued fields (e.g. value loaded from h5);
+                # exclude strings so that expr= values aren't treated as sequences.
+                kwargs = {
+                    k: float(v[t]) if (hasattr(v, "__len__") and not isinstance(v, str)) else v
+                    for k, v in extra_def_copy.items()
+                }
                 if "expr" in kwargs:
                     expr = kwargs["expr"]
                     if "{t}" not in expr:
                         expr = expr + "_{t}"
                     kwargs["expr"] = expr.format(t=t)
 
-                # Add the parameter
                 params.add(f"{param_name}_{t}", **kwargs)
 
     # Build and add main parameters
@@ -638,7 +641,10 @@ def run_fit_grad(
             param_name = extra_def_copy.pop("name")
             _extra_prefixes.append(param_name)
             for t in range(Nt):
-                kwargs = dict(extra_def_copy)
+                kwargs = {
+                    k: float(v[t]) if (hasattr(v, "__len__") and not isinstance(v, str)) else v
+                    for k, v in extra_def_copy.items()
+                }
                 if "expr" in kwargs:
                     expr = kwargs["expr"]
                     if "{t}" not in expr:
@@ -728,6 +734,32 @@ def run_fit_grad(
         else:
             bg = None
         return n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg
+
+    def _build_params_dict(x):
+        """Return {prefix: (Nt,) array} for every param: free, fixed, constrained, and extra."""
+        p = {}
+        for ep in _extra_prefixes:
+            p[ep] = jnp.stack([_get(x, f"{ep}_{t}") for t in range(Nt)])
+
+        def _fill(base, s):
+            prefix = base if base == "n" else f"{base}{s}"
+            if prefix in _constraints:
+                arr = _constraints[prefix](p)
+            else:
+                arr = jnp.stack([_get(x, f"{prefix}_{t}") for t in range(Nt)])
+            p[prefix] = arr
+
+        _fill("n", None)
+        for s in range(Nelectrons):
+            for b in ("Te", "ue", "pe", "efract"):
+                _fill(b, s)
+        for s in range(Nions):
+            for b in ("Ti", "ui", "pi", "ifract"):
+                _fill(b, s)
+        if background_order is not None:
+            for i in range(background_order + 1):
+                _fill("bg", i)
+        return p
 
     def _forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
         return _jitted_scattered_power_wavelength(
@@ -859,6 +891,8 @@ def run_fit_grad(
         success=converged,
         varying_keys=varying_keys,
     )
-    best_fit = _forward(*_unpack(jnp.array(result.x)))
+    final_x = jnp.array(result.x)
+    result.params_dict = {k: np.array(v) for k, v in _build_params_dict(final_x).items()}
+    best_fit = _forward(*_unpack(final_x))
 
     return result, best_fit

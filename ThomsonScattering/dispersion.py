@@ -59,10 +59,18 @@ def _Zprime(zeta, p, order = 8):
 
     n = jnp.arange(order // 2)
 
-    #compute the terms of the Laurent expansion (n appended as trailing axis)
-    Zprime_real_far_expansion = 1 / jnp.power(Az[..., jnp.newaxis], 2 * n + 1) * gamma((2 * n + 3) / p[..., jnp.newaxis])
+    # Guard the far-branch inputs against zeta=0 so the VJP stays finite.
+    # jnp.where evaluates the gradient of both branches regardless of the
+    # condition; 1/Az^(2n+1) -> inf at zeta=0, and 0*inf = NaN in the VJP.
+    # Substituting a safe dummy (1.0) in the discarded branch avoids this
+    # without changing the selected (near-branch) output.
+    safe_Az   = jnp.where(abs_zeta > 10, Az,   jnp.ones_like(Az))
+    safe_zeta = jnp.where(abs_zeta > 10, zeta, jnp.ones_like(zeta))
 
-    Zprime_real_far = -2 * C / (A ** 2 * zeta * jnp.sqrt(2) * p) * jnp.sum(Zprime_real_far_expansion, axis = -1)
+    #compute the terms of the Laurent expansion (n appended as trailing axis)
+    Zprime_real_far_expansion = 1 / jnp.power(safe_Az[..., jnp.newaxis], 2 * n + 1) * gamma((2 * n + 3) / p[..., jnp.newaxis])
+
+    Zprime_real_far = -2 * C / (A ** 2 * safe_zeta * jnp.sqrt(2) * p) * jnp.sum(Zprime_real_far_expansion, axis = -1)
 
     # Use jnp.where (select) instead of mask-and-add — avoids NaN propagation
     # from the far branch (which is inf at zeta=0) when masked out.

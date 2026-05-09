@@ -317,6 +317,11 @@ def build_settings_from_deck(deck):
 
     # ── 6. Fit settings, extra_params, output path ───────────────────────────
     extra_params = deck.get("extra_params", None)
+    if extra_params:
+        for entry in extra_params:
+            for key, val in list(entry.items()):
+                if isinstance(val, str) and key not in ("name", "expr"):
+                    entry[key] = _load_array(val, base_dir)
 
     fit_raw = dict(deck.get("fit", {}))
     backend = fit_raw.pop("backend", "lmfit")
@@ -347,12 +352,13 @@ def build_settings_from_deck(deck):
     )
 
 
-def save_fit_results(output_path, result, best_fit, backend, deck_text=None):
+def save_fit_results(output_path, result, best_fit, backend, deck_text=None, time_axis=None):
     """Save fit results to an HDF5 file.
 
     Datasets written:
     - ``/best_fit``         : (Nk, Nt) forward model at best-fit params
     - ``/params/<prefix>``  : (Nt,) array per parameter prefix
+    - ``/time``             : (Nt,) time array (if provided)
     File-level attributes:
     - ``loss``, ``success``, ``nfev`` (lmfit) or ``nit`` (grad), ``message``
     - ``deck_toml``         : raw deck text for provenance (if provided)
@@ -365,6 +371,7 @@ def save_fit_results(output_path, result, best_fit, backend, deck_text=None):
     best_fit    : array (Nk, Nt)
     backend     : ``"lmfit"`` or ``"grad"``
     deck_text   : str or None
+    time_axis   : array (Nt,) or None
     """
     import h5py
     from collections import defaultdict
@@ -374,6 +381,8 @@ def save_fit_results(output_path, result, best_fit, backend, deck_text=None):
 
     with h5py.File(output_path, "w") as fh:
         fh.create_dataset("best_fit", data=_np.asarray(best_fit))
+        if time_axis is not None:
+            fh.create_dataset("time", data=_np.asarray(time_axis))
         params_grp = fh.create_group("params")
 
         if backend == "lmfit":
@@ -388,18 +397,22 @@ def save_fit_results(output_path, result, best_fit, backend, deck_text=None):
             fh.attrs["success"] = bool(result.success)
             fh.attrs["message"] = str(getattr(result, "message", ""))
         else:  # grad
-            # Group varying params by prefix into (Nt,) arrays
-            prefix_vals = defaultdict(list)
-            for name, val in zip(result.varying_keys, result.x):
-                m = _re.match(r"^(.+)_(\d+)$", name)
-                if m:
-                    prefix_vals[m.group(1)].append((int(m.group(2)), float(val)))
-                else:
-                    prefix_vals[name].append((0, float(val)))
-            for prefix, indexed in prefix_vals.items():
-                indexed.sort()
-                arr = _np.array([v for _, v in indexed])
-                params_grp.create_dataset(prefix, data=arr)
+            if hasattr(result, "params_dict"):
+                for prefix, arr in result.params_dict.items():
+                    params_grp.create_dataset(prefix, data=_np.asarray(arr))
+            else:
+                # Fallback for results produced before params_dict was added.
+                prefix_vals = defaultdict(list)
+                for name, val in zip(result.varying_keys, result.x):
+                    m = _re.match(r"^(.+)_(\d+)$", name)
+                    if m:
+                        prefix_vals[m.group(1)].append((int(m.group(2)), float(val)))
+                    else:
+                        prefix_vals[name].append((0, float(val)))
+                for prefix, indexed in prefix_vals.items():
+                    indexed.sort()
+                    arr = _np.array([v for _, v in indexed])
+                    params_grp.create_dataset(prefix, data=arr)
             fh.attrs["loss"]    = float(result.fun)
             fh.attrs["nit"]     = int(result.nit)
             fh.attrs["success"] = bool(result.success)
