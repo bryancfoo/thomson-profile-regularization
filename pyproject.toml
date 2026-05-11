@@ -20,13 +20,13 @@ dependencies = [
 ]
 
 [project.scripts]
-fit-from-deck = "fit_from_deck:main"
+thomson-fit = "fit:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools]
-py-modules = ["fit_from_deck"]
+py-modules = ["fit"]
 
 [tool.setuptools.package-data]
 ThomsonScattering = ["dispersion_tables.h5"]

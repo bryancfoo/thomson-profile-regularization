@@ -4,7 +4,7 @@ Run this once before running the example fit:
     python make_example_data.py
 
 Then run the fit:
-    python fit_from_deck.py
+    python fit.py
     > Path to input deck (.toml): example_deck.toml
 """
 

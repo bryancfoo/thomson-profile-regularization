@@ -2,9 +2,9 @@
 
 Usage
 -----
-    fit-from-deck path/to/deck.toml      # after `pip install -e .`
-    python fit_from_deck.py path/to/deck.toml
-    python fit_from_deck.py              # falls back to interactive prompt
+    thomson-fit path/to/deck.toml        # after `pip install -e .`
+    python fit.py path/to/deck.toml
+    python fit.py                        # falls back to interactive prompt
 
 The deck schema follows the standard sections consumed by
 ``ThomsonScattering.utility.build_settings_from_deck`` (``[data]``,
