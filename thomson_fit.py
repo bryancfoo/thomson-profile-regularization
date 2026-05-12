@@ -3,8 +3,8 @@
 Usage
 -----
     thomson-fit path/to/deck.toml        # after `pip install -e .`
-    python fit.py path/to/deck.toml
-    python fit.py                        # falls back to interactive prompt
+    python thomson_fit.py path/to/deck.toml
+    python thomson_fit.py                # falls back to interactive prompt
 
 The deck schema follows the standard sections consumed by
 ``ThomsonScattering.utility.build_settings_from_deck`` (``[data]``,
@@ -19,7 +19,7 @@ resolved here before the standard parser runs:
   [plotting]                      Save initial-guess, streak, and profile pngs.
 
 The deck file's directory is the base for all relative paths it references.
-See ``example_deck.toml`` for the full deck schema with inline documentation.
+See ``example_fit_deck.toml`` for the full deck schema with inline documentation.
 """
 
 import sys

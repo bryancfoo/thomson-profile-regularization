@@ -1,11 +1,11 @@
-"""Generate example_data.h5 for use with example_deck.toml.
+"""Generate example_data.h5 for use with example_fit_deck.toml.
 
 Run this once before running the example fit:
     python make_example_data.py
 
 Then run the fit:
-    python fit.py
-    > Path to input deck (.toml): example_deck.toml
+    python thomson_fit.py
+    > Path to input deck (.toml): example_fit_deck.toml
 """
 
 import numpy as np

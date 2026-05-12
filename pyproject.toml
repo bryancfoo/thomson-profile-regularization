@@ -20,13 +20,14 @@ dependencies = [
 ]
 
 [project.scripts]
-thomson-fit = "fit:main"
+thomson-fit = "thomson_fit:main"
+thomson-forward = "thomson_forward:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools]
-py-modules = ["fit"]
+py-modules = ["thomson_fit", "thomson_forward"]
 
 [tool.setuptools.package-data]
 ThomsonScattering = ["dispersion_tables.h5"]

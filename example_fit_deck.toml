@@ -1,11 +1,11 @@
-# example_deck.toml — synthetic test case for fit_from_deck.py
+# example_fit_deck.toml — synthetic test case for fit.py
 #
 # Prerequisites:
 #   python make_example_data.py   (generates example_data.h5)
 #
 # Then run the fit:
-#   python fit_from_deck.py
-#   > Path to input deck (.toml): example_deck.toml
+#   python thomson_fit.py
+#   > Path to input deck (.toml): example_fit_deck.toml
 #
 # The result is written to example_result.h5 (see [output] below).
 # Compare /params/Te0, /params/n, etc. against the true profiles stored
@@ -240,7 +240,7 @@ method   = "nelder"
 
 # ── Output ────────────────────────────────────────────────────────────────────
 [output]
-path = "example_result.h5"
+path = "example_fit_result.h5"
 # Written datasets:
 #   /best_fit          (Nk, Nt) forward-model spectrum at best-fit params
 #   /params/<prefix>   (Nt,) recovered profile per parameter prefix
