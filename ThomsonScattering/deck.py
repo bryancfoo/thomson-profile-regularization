@@ -1,73 +1,19 @@
+"""TOML input-deck loading, expansion, and result writing.
+
+Two public entry points:
+- ``load_deck(path)`` reads a TOML file and tags it with ``_base_dir`` /
+  ``_deck_stem`` so downstream code can resolve relative paths.
+- ``build_settings_from_deck(deck)`` turns the parsed dict into the argument
+  bundle that ``run_fit_grad`` consumes.
+
+``save_fit_results`` writes the standard HDF5 output produced by both CLI
+entry points after a successful fit.
+"""
 import pathlib as _pathlib
 import re as _re
 
 import numpy as _np
-import jax.numpy as jnp
 
-
-#Some functions for moving data around
-#Or reshaping arrays into the shape needed for the forward model
-#Forward model wants the shape [Nions, Nt, Nk]
-
-def reshape_moments(Q, Nions, Nt):
-    #If the input is scalar:
-    if jnp.ndim(Q)==0:
-        return jnp.ones((Nions, Nt))[:, :, jnp.newaxis] * Q
-
-    # Check to see if it's only 1D, eg one ion species
-    if jnp.ndim(Q) == 1:
-        # If it is, reshape to (, Nt, )
-        return Q[jnp.newaxis, :, jnp.newaxis]
-    elif jnp.ndim(Q) == 2:
-        #This is if it's in the shape (Nions, Nt) already
-        #Recast as (Nions, Nt,)
-        return Q[:, :, jnp.newaxis]
-
-# This matches the shapes of a, b 1D arrays to be [Na, Nb]
-# It's here because interpax can't broadcast -.-
-
-#Pulls params out of a output.params object
-def extract_params_as_array(params, var, Nindices):
-    return jnp.asarray([params[f"{var}_{i}"].value for i in range(Nindices)])
-
-def extract_all_params_as_dict(params):
-    """Extract all lmfit parameters into a dict of arrays, grouped by prefix.
-
-    Parameters named like `Te0_3` are split into prefix `Te0` and index `3`.
-    Each prefix maps to a 1-D array of its values ordered by index.
-
-    Returns
-    -------
-    dict mapping prefix (str) -> jnp.array of values
-    """
-    from collections import defaultdict
-    import re
-
-    # Group key names by their prefix (everything before the last _<digits>)
-    prefix_indices = defaultdict(list)
-    for key in params:
-        m = re.match(r"^(.+)_(\d+)$", key)
-        if m:
-            prefix_indices[m.group(1)].append(int(m.group(2)))
-
-    result = {}
-    for prefix, indices in prefix_indices.items():
-        Nindices = max(indices) + 1
-        result[prefix] = extract_params_as_array(params, prefix, Nindices)
-    return result
-
-
-#Adds a profile of params to an existing lmfit Parameters object
-def add_params_from_array(params, var, value_array, settings):
-    Nvalues = len(value_array)
-    if isinstance(settings, dict):
-        settings = [settings] * Nvalues
-    for i in range(Nvalues):
-        params.add(var + f"_{i}", value=value_array[i], **settings[i])
-    #params are mutable (I think) so no return is needed?
-
-
-# ─── Input deck helpers ─────────────────────────────────────────────────────
 
 def load_deck(deck_path):
     """Parse a TOML input deck and return the config dict.
@@ -118,7 +64,6 @@ def _load_array(value, base_dir):
         )
     base_dir = _pathlib.Path(base_dir)
 
-    # HDF5 with embedded dataset spec: "some/path.h5:dataset"
     if ".h5:" in value:
         file_part, dataset = value.split(".h5:", 1)
         return _load_h5_dataset(base_dir / (file_part + ".h5"), dataset)
@@ -155,12 +100,7 @@ def _require(d, keys, section):
 
 
 def build_settings_from_deck(deck):
-    """Convert a parsed deck dict (from load_deck) into the arguments for run_fit.
-
-    Parameters
-    ----------
-    deck : dict
-        Output of load_deck (includes private ``_base_dir`` and ``_deck_stem`` keys).
+    """Convert a parsed deck dict (from load_deck) into arguments for run_fit_grad.
 
     Returns
     -------
@@ -169,13 +109,12 @@ def build_settings_from_deck(deck):
     measurement_settings : dict
     penalty_settings    : dict or None
     params_settings     : dict or None
-    fit_settings        : dict  (``backend`` key already removed)
+    fit_settings        : dict
     extra_params        : list of dict or None
     constraints_settings : dict[str, str] or None
         Mapping of parameter prefix → expression string from the deck's
-        ``[constraints]`` table. Same string drives both backends.
+        ``[constraints]`` table.
     output_path         : pathlib.Path
-    backend             : str  ``"lmfit"`` or ``"grad"``
     """
     base_dir = deck.get("_base_dir", _pathlib.Path("."))
 
@@ -205,7 +144,6 @@ def build_settings_from_deck(deck):
         "probe_vec", "scatter_vec", "ue_dir", "ui_dir", "wavelengths",
     ], section="[measurement]")
 
-    # Fields that must become numpy arrays (inline list or file ref)
     _arr_fields = {
         "wavelengths", "instr_func_arr", "throughput", "aperture_weights",
         "scatter_vec", "probe_vec", "ue_dir", "ui_dir", "ion_z", "ion_a",
@@ -225,7 +163,7 @@ def build_settings_from_deck(deck):
 
     # Optional probe-beam parameters for the SRS/SBS gain correction
     # (Turnbull et al., PRL 136, 135101 (2026)). Absent section ⇒ correction
-    # disabled, output identical to gain-free model.
+    # disabled.
     pb = deck.get("probe_beam")
     if pb is not None:
         mode = pb.get("gain_mode", "exact")
@@ -276,7 +214,12 @@ def build_settings_from_deck(deck):
                 )
             for t in range(Nt):
                 v = float(arr[t])
-                entry = {"value": v, **other}
+                entry = {"value": v}
+                for ok, ov in other.items():
+                    if hasattr(ov, "__len__") and not isinstance(ov, str):
+                        entry[ok] = ov[t]
+                    else:
+                        entry[ok] = ov
                 if rel_min is not None:
                     entry["min"] = v * (1 + rel_min)
                 if rel_max is not None:
@@ -309,7 +252,7 @@ def build_settings_from_deck(deck):
         penalty_settings[prefix] = ps
     penalty_settings = penalty_settings or None
 
-    # ── 5. Constraints (string expressions; both backends compile their own) ─
+    # ── 5. Constraints (string expressions evaluated against jnp arrays) ────
     constraints_raw = deck.get("constraints", {})
     constraints_settings = {
         str(k): str(v) for k, v in constraints_raw.items()
@@ -319,17 +262,17 @@ def build_settings_from_deck(deck):
     extra_params = deck.get("extra_params", None)
     if extra_params:
         for entry in extra_params:
+            # `expr` was an lmfit-backend-only constraint field; drop silently
+            # so old decks load cleanly. Express constraints via [constraints].
+            entry.pop("expr", None)
             for key, val in list(entry.items()):
-                if isinstance(val, str) and key not in ("name", "expr"):
+                if isinstance(val, str) and key != "name":
                     entry[key] = _load_array(val, base_dir)
 
-    fit_raw = dict(deck.get("fit", {}))
-    backend = fit_raw.pop("backend", "lmfit")
-    if backend not in ("lmfit", "grad"):
-        raise ValueError(
-            f"[fit] backend must be 'lmfit' or 'grad', got {backend!r}"
-        )
-    fit_settings = fit_raw
+    fit_settings = dict(deck.get("fit", {}))
+    # Legacy lmfit-backend keys — silently dropped so old decks load cleanly.
+    fit_settings.pop("backend", None)
+    fit_settings.pop("method", None)
 
     output_raw = deck.get("output", {})
     out_rel = output_raw.get("path", None)
@@ -348,11 +291,10 @@ def build_settings_from_deck(deck):
         extra_params,
         constraints_settings,
         output_path,
-        backend,
     )
 
 
-def save_fit_results(output_path, result, best_fit, backend, deck_text=None, time_axis=None):
+def save_fit_results(output_path, result, best_fit, deck_text=None, time_axis=None):
     """Save fit results to an HDF5 file.
 
     Datasets written:
@@ -360,21 +302,10 @@ def save_fit_results(output_path, result, best_fit, backend, deck_text=None, tim
     - ``/params/<prefix>``  : (Nt,) array per parameter prefix
     - ``/time``             : (Nt,) time array (if provided)
     File-level attributes:
-    - ``loss``, ``success``, ``nfev`` (lmfit) or ``nit`` (grad), ``message``
+    - ``loss``, ``success``, ``nit``
     - ``deck_toml``         : raw deck text for provenance (if provided)
-
-    Parameters
-    ----------
-    output_path : str or pathlib.Path
-    result      : lmfit.MinimizerResult  (backend='lmfit')
-                  or types.SimpleNamespace (backend='grad')
-    best_fit    : array (Nk, Nt)
-    backend     : ``"lmfit"`` or ``"grad"``
-    deck_text   : str or None
-    time_axis   : array (Nt,) or None
     """
     import h5py
-    from collections import defaultdict
 
     output_path = _pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,38 +315,10 @@ def save_fit_results(output_path, result, best_fit, backend, deck_text=None, tim
         if time_axis is not None:
             fh.create_dataset("time", data=_np.asarray(time_axis))
         params_grp = fh.create_group("params")
-
-        if backend == "lmfit":
-            param_dict = extract_all_params_as_dict(result.params)
-            for name, arr in param_dict.items():
-                params_grp.create_dataset(name, data=_np.asarray(arr))
-            try:
-                fh.attrs["loss"] = float(result.residual)
-            except (TypeError, ValueError):
-                fh.attrs["loss"] = float("nan")
-            fh.attrs["nfev"]    = int(getattr(result, "nfev", 0))
-            fh.attrs["success"] = bool(result.success)
-            fh.attrs["message"] = str(getattr(result, "message", ""))
-        else:  # grad
-            if hasattr(result, "params_dict"):
-                for prefix, arr in result.params_dict.items():
-                    params_grp.create_dataset(prefix, data=_np.asarray(arr))
-            else:
-                # Fallback for results produced before params_dict was added.
-                prefix_vals = defaultdict(list)
-                for name, val in zip(result.varying_keys, result.x):
-                    m = _re.match(r"^(.+)_(\d+)$", name)
-                    if m:
-                        prefix_vals[m.group(1)].append((int(m.group(2)), float(val)))
-                    else:
-                        prefix_vals[name].append((0, float(val)))
-                for prefix, indexed in prefix_vals.items():
-                    indexed.sort()
-                    arr = _np.array([v for _, v in indexed])
-                    params_grp.create_dataset(prefix, data=arr)
-            fh.attrs["loss"]    = float(result.fun)
-            fh.attrs["nit"]     = int(result.nit)
-            fh.attrs["success"] = bool(result.success)
-
+        for prefix, arr in result.params_dict.items():
+            params_grp.create_dataset(prefix, data=_np.asarray(arr))
+        fh.attrs["loss"]    = float(result.fun)
+        fh.attrs["nit"]     = int(result.nit)
+        fh.attrs["success"] = bool(result.success)
         if deck_text is not None:
             fh.attrs["deck_toml"] = deck_text

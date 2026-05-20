@@ -6,3 +6,12 @@ dist/
 build/
 .ipynb_checkpoints/
 *test*
+
+# Generated artifacts in example/
+example/data.h5
+example/data_iaw.h5
+example/fit_result*.h5
+example/*.png
+
+# Generated plots at the repo root
+*.png

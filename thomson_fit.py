@@ -7,23 +7,27 @@ Usage
     python thomson_fit.py                # falls back to interactive prompt
 
 The deck schema follows the standard sections consumed by
-``ThomsonScattering.utility.build_settings_from_deck`` (``[data]``,
+``ThomsonScattering.deck.build_settings_from_deck`` (``[data]``,
 ``[measurement]``, ``[probe_beam]``, ``[params]``, ``[penalty]``, ``[fit]``,
 ``[output]``, ``[[extra_params]]``, ``[constraints]``) plus a few extensions
 resolved here before the standard parser runs:
 
   [measurement.throughput_xlsx]   Read xlsx → smooth → interp → throughput[].
   [measurement.irf_hdf4]          Read HDF4 → crop → mean → instr_func_arr[].
-  [output].legacy_layout = true   Also write flat top-level datasets
-                                  (e.g. epw_lam, epw_time, n_fit, ...).
   [plotting]                      Save initial-guess, streak, and profile pngs.
 
 The deck file's directory is the base for all relative paths it references.
-See ``example_fit_deck.toml`` for the full deck schema with inline documentation.
+See ``DECK_API.md`` at the repo root for the full deck schema.
 """
 
 import sys
 from pathlib import Path
+
+# Force float64 BEFORE any other code touches jax.numpy.  Required for the
+# Hessian preconditioner inside the *_nuts fit modes — dual-averaging step
+# sizes routinely shrink past float32's ~1e-38 minimum.
+import jax as _jax
+_jax.config.update("jax_enable_x64", True)
 
 import h5py
 import matplotlib.pyplot as plt
@@ -31,12 +35,12 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter
 
-from ThomsonScattering.utility import (
+from ThomsonScattering.deck import (
     load_deck,
     build_settings_from_deck,
     save_fit_results,
 )
-from ThomsonScattering.fitting import run_fit, run_fit_grad, build_params, _compute_fit
+from ThomsonScattering.fitting import run_fit_grad, compute_initial_fit
 
 
 # ─── deck preprocessing extensions ─────────────────────────────────────────────
@@ -116,21 +120,10 @@ def _resolve_irf_hdf4(deck, base_dir, Nk, Nt):
 
 def _plot_initial_guess(measurement, params_settings, extra_params, Pkl_data,
                         lam_nm, time_axis, png_path, shot_num):
-    Nelectrons = measurement["Nelectrons"]
-    Nions = len(measurement["ion_z"])
     Nt = Pkl_data.shape[1]
-    p = build_params(Nelectrons, Nions, Nt, params_settings)
-    if extra_params:
-        for entry in extra_params:
-            ed = dict(entry)
-            name = ed.pop("name")
-            for t in range(Nt):
-                kwargs = {
-                    k: float(v[t]) if (hasattr(v, "__len__") and not isinstance(v, str)) else v
-                    for k, v in ed.items()
-                }
-                p.add(f"{name}_{t}", **kwargs)
-    init_fit = np.asarray(_compute_fit(p, measurement))
+    init_fit = np.asarray(
+        compute_initial_fit(measurement, params_settings, extra_params, Nt)
+    )
     mid = Nt // 2
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(lam_nm, Pkl_data[:, mid], label="Data")
@@ -233,32 +226,6 @@ def _plot_profiles_epw(profiles, time_axis, png_path, shot_num):
     plt.close(fig)
 
 
-# ─── legacy h5 layout ──────────────────────────────────────────────────────────
-
-def _save_legacy_layout(out_path, prefix, flatten_spec, profiles,
-                        Pkl_data, Pkl_var, lam_nm, time_axis):
-    """Append flat top-level datasets to an h5 already written by save_fit_results."""
-    rename = {}
-    for entry in flatten_spec:
-        if ":" in entry:
-            src, dst = entry.split(":", 1)
-        else:
-            src = dst = entry
-        rename[src] = dst
-    with h5py.File(out_path, "a") as hf:
-        hf.create_dataset(f"{prefix}lam",     data=lam_nm)
-        hf.create_dataset(f"{prefix}time",    data=np.asarray(time_axis))
-        hf.create_dataset(f"{prefix}Pkl_avg", data=np.asarray(Pkl_data))
-        hf.create_dataset(f"{prefix}Pkl_var", data=np.asarray(Pkl_var))
-        for src, dst in rename.items():
-            if src not in profiles:
-                raise KeyError(
-                    f"[output].legacy_flatten references param prefix {src!r} "
-                    f"but only have {sorted(profiles.keys())}"
-                )
-            hf.create_dataset(f"{dst}_fit", data=np.asarray(profiles[src]))
-
-
 # ─── main ──────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -304,10 +271,10 @@ def main(argv=None):
     (
         Pkl_data, Pkl_var,
         meas, pen, pars, fit_kw,
-        extras, constraints, out_path, backend,
+        extras, constraints, out_path,
     ) = build_settings_from_deck(deck)
 
-    print(f"\nRunning fit  backend={backend!r}  Nt={Pkl_data.shape[1]}  Nk={Pkl_data.shape[0]}")
+    print(f"\nRunning fit  Nt={Pkl_data.shape[1]}  Nk={Pkl_data.shape[0]}")
 
     # Plot initial-guess diagnostic before launching the optimizer.
     plot_cfg = deck.get("plotting", {})
@@ -328,51 +295,25 @@ def main(argv=None):
                             lam_nm, time_axis, base_dir / init_png, shot_num)
         print(f"Wrote {init_png}")
 
-    if backend == "lmfit":
-        result, best_fit = run_fit(
-            Pkl_data, Pkl_var, meas,
-            penalty_settings=pen,
-            params_settings=pars,
-            fit_settings=fit_kw,
-            extra_params=extras,
-            constraints=constraints,
-            progress=True,
-        )
-        loss    = float(result.residual) if not hasattr(result.residual, "__len__") else float("nan")
-        neval   = getattr(result, "nfev", "?")
-        success = result.success
-        msg     = getattr(result, "message", "")
-        print(f"\nloss={loss:.6g}  nfev={neval}  success={success}  message={msg!r}")
-    else:
-        result, best_fit = run_fit_grad(
-            Pkl_data, Pkl_var, meas,
-            penalty_settings=pen,
-            params_settings=pars,
-            fit_settings=fit_kw,
-            extra_params=extras,
-            constraints=constraints,
-            progress=True,
-        )
-        print(f"\nloss={result.fun:.6g}  nit={result.nit}  success={result.success}")
+    result, best_fit = run_fit_grad(
+        Pkl_data, Pkl_var, meas,
+        penalty_settings=pen,
+        params_settings=pars,
+        fit_settings=fit_kw,
+        extra_params=extras,
+        constraints=constraints,
+        progress=True,
+    )
+    print(f"\nloss={result.fun:.6g}  nit={result.nit}  success={result.success}")
 
     best_fit_np = np.asarray(best_fit)
 
-    save_fit_results(out_path, result, best_fit_np, backend, deck_text=deck_text, time_axis=time_axis)
+    save_fit_results(out_path, result, best_fit_np, deck_text=deck_text, time_axis=time_axis)
     print(f"Results saved to: {out_path}")
 
     # Read the per-prefix profiles back for plotting and optional legacy layout.
     with h5py.File(out_path, "r") as hf:
         profiles = {k: np.asarray(hf["params"][k]) for k in hf["params"]}
-
-    output_cfg = deck.get("output", {})
-    if output_cfg.get("legacy_layout", False):
-        prefix  = output_cfg.get("legacy_prefix", "")
-        flatten = output_cfg.get("legacy_flatten", [])
-        _save_legacy_layout(
-            out_path, prefix, flatten, profiles,
-            np.asarray(Pkl_data), np.asarray(Pkl_var), lam_nm, time_axis,
-        )
-        print(f"Appended legacy layout to {out_path}")
 
     streak_png = plot_cfg.get("streak_png")
     if streak_png:
@@ -383,20 +324,8 @@ def main(argv=None):
     profiles_png = plot_cfg.get("profiles_png")
     layout = plot_cfg.get("profile_layout", "epw")
     if profiles_png:
-        flatten = output_cfg.get("legacy_flatten", [])
-        rename = {}
-        for entry in flatten:
-            if ":" in entry:
-                src, dst = entry.split(":", 1)
-            else:
-                src = dst = entry
-            rename[dst] = src
-        plot_profiles = {}
-        for legacy_name in ("n", "Te", "pe"):
-            src = rename.get(legacy_name, legacy_name)
-            if src in profiles:
-                plot_profiles[legacy_name] = profiles[src]
         if layout == "epw":
+            plot_profiles = {k: profiles[k] for k in ("n", "Te", "pe") if k in profiles}
             _plot_profiles_epw(plot_profiles, time_axis, base_dir / profiles_png, shot_num)
             print(f"Wrote {profiles_png}")
         elif layout == "iaw":

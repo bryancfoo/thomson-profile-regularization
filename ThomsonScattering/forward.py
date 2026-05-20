@@ -8,8 +8,7 @@ from . import gain as _gain
 from .dispersion import _Zprime
 from jax.scipy.special import gamma, gammaincc
 from jax.scipy.signal import convolve
-from .utility import reshape_moments
-import matplotlib.pyplot as plt
+from .arrays import reshape_moments
 
 
 # Bundle of intermediates returned by `_spectral_density`. The susceptibilities
@@ -55,7 +54,6 @@ def _spectral_density(
         scatter_vec,
         ue_dir,
         ui_dir,
-        Nelectrons=1, #this input doesn't actually do anything, it's to allow the dict in the fitting functions to unpack more easily...
 ):
     #Compute the Thomson geometry
     scattering_angle = jnp.arccos(jnp.dot(probe_vec, scatter_vec))
@@ -243,7 +241,7 @@ def spectral_density(
 #Computes the wavelength spectrum (NOT the frequency spectrum!) of the scattered power
 #This is what you download off omegaops
 #Normalization options might be helpful for data analysis
-def _scattered_power_wavelength(
+def scattered_power_wavelength(
         n,
         ue,
         ui,
@@ -386,23 +384,20 @@ def _scattered_power_wavelength(
         powers = lam_norm[:, jnp.newaxis] ** i_arr[jnp.newaxis, :]  # (Nk, K+1)
         Pklam = Pklam + powers @ background_coefs  # (Nk, Nt)
 
+    # Replace NaN (notch pixels) before multiplying by norm so the VJP of
+    # (Pklam * norm) never computes 0 * NaN = NaN when backpropagating through
+    # the shared norm scalar.  _log_likelihood masks these pixels via isnan(data).
+    Pklam_finite = jnp.where(jnp.isnan(Pklam), 0.0, Pklam)
+
     # normalization_type is a static arg under jit, so branching here is
     # compile-time: only the selected reduction is traced.
     if normalization_type == "max":
-        norm = normalization_scale / jnp.nanmax(Pklam, axis=0)
+        norm = normalization_scale / jnp.nanmax(Pklam_finite, axis=0)
     elif normalization_type == "sum":
-        norm = normalization_scale / jnp.nansum(Pklam, axis=0)
+        norm = normalization_scale / jnp.nansum(Pklam_finite, axis=0)
     else:  # "integral"
-        Pklam_finite = jnp.where(jnp.isnan(Pklam), 0.0, Pklam)
         norm = normalization_scale / jnp.trapezoid(Pklam_finite, wavelengths, axis=0)
 
-    Pklam = Pklam * norm
-
-
+    Pklam = Pklam_finite * norm
 
     return Pklam
-
-
-def scattered_power_wavelength(*args, **kwargs):
-
-    return _scattered_power_wavelength(*args, **kwargs)

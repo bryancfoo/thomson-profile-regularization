@@ -16,11 +16,10 @@ _zeta = jnp.linspace(0, 10, 2000)
 _h5_path = os.path.join(os.path.dirname(__file__), 'dispersion_tables.h5')
 with h5py.File(_h5_path, 'r') as hf:
     _Zprime_real = jnp.array(hf["Zprime_real"])
-    #_Zprime_imag = hf["Zprime_imag"]
 
-#Create the interpolator functions
+#Create the interpolator function for the real part. Imaginary part is purely
+#analytic in terms of gamma functions; see _Zprime below.
 _Zprime_real_interp = interpax.Interpolator2D(_zeta, _p, _Zprime_real)
-#_Zprime_imag_interp = interpax.Interpolator2D(_zeta, _p, _Zprime_imag)
 
 #Derivative of the plasma dispersion function as a function of the phase velocity zeta (normalized by vth)
 # and the supergaussian order p

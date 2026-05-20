@@ -1,0 +1,151 @@
+# example/fit_deck_full.toml — "kitchen sink" deck exercising every
+# optional feature of the deck API on the D+C IAW data:
+#
+#   * [probe_beam]      SRS/SBS gain correction (Turnbull et al., PRL 2026)
+#   * background_order  polynomial background coefficients (bg0, bg1)
+#   * notch             NaN-mask a narrow band around the residual probe line
+#   * throughput        wavelength-dependent spectrometer sensitivity (CSV)
+#   * instr_func_arr    per-time Gaussian IRF stored in the data file
+#   * [penalty.*]       Tikhonov regularization on Te0 and Ti0
+#   * adam optimizer    (good for cases where LBFGS line search struggles)
+#
+# Run:
+#     python example/make_data_iaw.py
+#     thomson-fit example/fit_deck_full.toml
+
+[data]
+path        = "data_iaw.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+
+[measurement]
+Nelectrons         = 1
+ion_z              = [1, 6]
+ion_a              = [2, 12]
+probe_wavelength   = 2.6325e-7
+probe_vec          = [0.0,        0.0, 1.0]
+scatter_vec        = [0.8660254,  0.0, 0.5]
+ue_dir             = [1.0, 0.0, 0.0]
+ui_dir             = [1.0, 0.0, 0.0]
+wavelengths        = "data_iaw.h5:wavelengths"
+normalization_type = "max"
+
+# Per-time IRF (Nk, Nt) — Gaussian FWHM ≈ 25 pm baked into data_iaw.h5.
+instr_func_arr     = "data_iaw.h5:irf"
+irf_normalization  = "area"
+
+# Wavelength-dependent throughput (Nk,) — newline-separated CSV.
+throughput         = "throughput.csv"
+
+# Mask a narrow band around the probe line.  Real spectrometers often have
+# stray-light contamination from the residual probe; setting notch removes
+# those wavelengths from the chi^2.  Demo data here has no actual spike so
+# the notch is kept narrow (~2 pm) — widen it if your data needs masking.
+notch              = [263.249e-9, 263.251e-9]
+
+# Polynomial background of order 1: adds bg0_t and bg1_t per time step.
+# In the forward model, bg = sum_i bg_i * ((lam - lam0)/lam0)^i.
+background_order   = 1
+
+# Optional SRS/SBS amplification correction.  Multiplies S(k,w) by
+# (e^(gL) - 1) / (gL); see ThomsonScattering/gain.py.  Set gain_mode="exact"
+# to enable; this demo leaves it "off" so the demo data (which carries no
+# baked-in amplification) is consistent with the forward model.
+[probe_beam]
+intensity_W_per_cm2 = 9.2e14
+diameter_um         = 165.0
+pol_p_fraction      = 1.0
+gain_mode           = "off"
+
+# ── Free parameters: Te0, Ti0 (D), ifract0 (D). ─────────────────────────────
+# Ti1 = Ti0 and ifract1 = 1 - ifract0 set by [constraints]; n fixed.
+[params.n]
+value = "data_iaw.h5:ne_true_cm3"
+vary  = false
+
+[params.Te0]
+value = 400.0
+min   = 50.0
+max   = 2000.0
+vary  = true
+
+[params.Ti0]
+value = 300.0
+min   = 50.0
+max   = 1500.0
+vary  = true
+
+[params.ifract0]
+value = 0.5
+min   = 0.05
+max   = 0.95
+vary  = true
+
+[params.efract0]
+value = 1.0
+vary  = false
+
+[params.ue0]
+value = 0.0
+vary  = false
+
+[params.ui0]
+value = 0.0
+vary  = false
+
+[params.ui1]
+value = 0.0
+vary  = false
+
+[params.pe0]
+value = 2.0
+vary  = false
+
+[params.pi0]
+value = 2.0
+vary  = false
+
+[params.pi1]
+value = 2.0
+vary  = false
+
+# Background coefficients held at 0 (data has no real background).  Set
+# vary = true if your data needs them fit.
+[params.bg0]
+value = 0.0
+vary  = false
+
+[params.bg1]
+value = 0.0
+vary  = false
+
+[constraints]
+Ti1     = "Ti0"
+ifract1 = "1 - ifract0"
+
+# ── Tikhonov regularization in time on Te0 and Ti0 ──────────────────────────
+# lambda_weights = [L0, L1, L2] penalize 0th / 1st / 2nd time derivatives.
+# relative = true rescales each derivative by the local parameter magnitude.
+[penalty.Te0]
+profile_axis   = "data_iaw.h5:time"
+lambda_weights = [0.0, 0.5, 0.2]
+thresholds     = [0.0, 0.0, 0.0]
+relative       = true
+monotonic      = 0
+
+[penalty.Ti0]
+profile_axis   = "data_iaw.h5:time"
+lambda_weights = [0.0, 0.5, 0.2]
+thresholds     = [0.0, 0.0, 0.0]
+relative       = true
+monotonic      = 0
+
+# ── Optimizer: Adam ─────────────────────────────────────────────────────────
+[fit]
+optimizer = "adam"
+lr        = 0.05
+max_iter  = 1500
+tol       = 1e-8
+
+[output]
+path = "fit_result_full.h5"

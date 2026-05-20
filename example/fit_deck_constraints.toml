@@ -1,0 +1,123 @@
+# example/fit_deck_constraints.toml — D + C IAW fit with [constraints] and
+# [[extra_params]].  Demonstrates:
+#
+#   * multi-ion (D + C) fit on the IAW data
+#   * [constraints] enforcing charge balance (ifract1 = 1 - ifract0) and
+#     D/C thermal equilibrium (Ti1 = Ti0)
+#   * [[extra_params]] introducing a dummy free variable that constraints
+#     can reference by name
+#   * sgld_lbfgs optimizer (SGLD warmup → LBFGS refinement)
+#
+# Run:
+#     python example/make_data_iaw.py          # one-time: generate data_iaw.h5
+#     python thomson_fit.py example/fit_deck_constraints.toml
+
+[data]
+path        = "data_iaw.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1, 6]                    # D (z=1), C (z=6)
+ion_a            = [2, 12]                   # atomic mass in amu
+probe_wavelength = 2.6325e-7                 # 263.25 nm in meters
+probe_vec        = [0.0,        0.0, 1.0]
+scatter_vec      = [0.8660254,  0.0, 0.5]    # 60° from probe in x–z plane
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+wavelengths        = "data_iaw.h5:wavelengths"
+normalization_type = "max"
+# Per-time Gaussian IRF (FWHM ≈ 25 pm) baked into data_iaw.h5.
+instr_func_arr     = "data_iaw.h5:irf"
+irf_normalization  = "area"
+# Wavelength-dependent throughput, also baked into data_iaw.h5.  (Deck 3
+# loads the same array from a CSV to demonstrate the other file format.)
+throughput         = "data_iaw.h5:throughput"
+
+# ── Free parameters: Te0, Ti0 (D), ifract0 (D). ─────────────────────────────
+# Ti1 (C) and ifract1 (C) are NOT listed here — they're set by [constraints].
+# n is fixed: under normalization_type="max" the IAW lineshape doesn't
+# constrain absolute density well; for ne recovery use an EPW window instead.
+[params.n]
+value = "data_iaw.h5:ne_true_cm3"  # array-valued init from truth
+vary  = false
+
+[params.Te0]
+value = 400.0
+min   = 50.0
+max   = 2000.0
+vary  = true
+
+[params.Ti0]
+value = 300.0
+min   = 50.0
+max   = 1500.0
+vary  = true
+
+[params.ifract0]
+value = 0.5
+min   = 0.01
+max   = 0.99
+vary  = true
+
+# Held at physical values
+[params.efract0]
+value = 1.0
+vary  = false
+
+[params.ue0]
+value = 0.0
+vary  = false
+
+[params.ui0]
+value = 0.0
+vary  = false
+
+[params.ui1]
+value = 0.0
+vary  = false
+
+[params.pe0]
+value = 2.0
+vary  = false
+
+[params.pi0]
+value = 2.0
+vary  = false
+
+[params.pi1]
+value = 2.0
+vary  = false
+
+# ── Constraint dummy — never enters the forward model directly, only ────────
+# referenced from [constraints]. Floors the carbon charge fraction so the
+# sum-to-one rule can't drive it below the spectrometer's sensitivity.
+[[extra_params]]
+name  = "ifract1_floor"
+value = 0.10
+min   = 0.0
+max   = 0.5
+vary  = true
+
+# ── Constraints: prefix → expression in terms of other prefixes. ────────────
+# Names refer to the bare prefix (no _{t} suffix); per-time substitution is
+# automatic.  Available functions: min, max, abs, where, clip, sqrt, exp, log.
+[constraints]
+Ti1     = "Ti0"                                # D / C thermal equilibrium
+ifract1 = "max(ifract1_floor, 1 - ifract0)"    # sum-to-1 with a floor
+
+# ── Optimizer: SGLD warmup → LBFGS ──────────────────────────────────────────
+# SGLD escapes shallow local minima; LBFGS then polishes to high precision.
+[fit]
+optimizer        = "sgld_lbfgs"
+max_iter         = 500
+sgld_iter        = 200
+sgld_lr          = 5e-4
+sgld_noise_scale = 0.05
+sgld_noise_decay = 0.55
+sgld_seed        = 0
+tol              = 1e-9
+
+[output]
+path = "fit_result_constraints.h5"

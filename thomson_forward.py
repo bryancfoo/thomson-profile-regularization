@@ -11,8 +11,7 @@ forward-model Thomson scattering spectrum, and plots the time-resolved streak.
 The deck schema includes sections: [profiles], [measurement], [plotting], and
 [output].
 
-See ``example_forward_deck.toml`` for the full deck schema with inline
-documentation.
+See ``DECK_API.md`` at the repo root for the full deck schema.
 """
 
 import sys
@@ -22,18 +21,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.constants import k as kB, e
 
-from ThomsonScattering.utility import load_deck, _load_array
+from ThomsonScattering.deck import load_deck, _load_array, _require
 from ThomsonScattering.forward import scattered_power_wavelength
-
-
-def _require(d, keys, section):
-    """Check that required keys are present in a dict."""
-    missing = [k for k in keys if k not in d]
-    if missing:
-        raise KeyError(
-            f"Missing required keys in {section}: {missing}. "
-            "Check your input deck."
-        )
 
 
 def build_settings_from_forward_deck(deck):
