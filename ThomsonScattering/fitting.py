@@ -330,6 +330,46 @@ def _make_unconstrained_transforms(lower_np, upper_np):
     return to_internal_np, to_external_jax, lower, upper
 
 
+def _log_det_jac_u(u, lower, upper, *, floor=1e-30):
+    """Sum of per-coordinate log|dT_i/du_i| for the bijector built in
+    :func:`_make_unconstrained_transforms`.
+
+    Required for sampling targets where we want samples of ``x = T(u)`` to be
+    distributed as ``p(x) ∝ exp(-V(x))``: change of variables means we draw
+    ``u`` from ``exp(-V(T(u)) + log|det dT/du|)``. For optimization the term
+    is irrelevant (MAP is invariant under reparameterization), so it lives
+    here separately rather than inside ``objective_u``.
+
+    Per-coordinate derivatives matching the branches in ``to_external_jax``:
+
+    - bounded (arcsin):  x = lo + (hi-lo)/2 * (sin u + 1)
+                         |dx/du| = (hi-lo)/2 * |cos u|
+    - lo-only (sqrt):    x = lo - 1 + sqrt(u^2 + 1)
+                         |dx/du| = |u| / sqrt(u^2 + 1)
+    - hi-only (sqrt):    x = hi + 1 - sqrt(u^2 + 1)
+                         |dx/du| = |u| / sqrt(u^2 + 1)
+    - unbounded:         dx/du = 1, log term = 0
+
+    ``floor`` keeps gradients finite if a sample lands exactly at u = 0 (sqrt
+    branch) or u = ±π/2 (arcsin branch). The bijector already repels samples
+    away from these points; the floor is belt-and-suspenders.
+    """
+    lo_fin = jnp.isfinite(lower)
+    hi_fin = jnp.isfinite(upper)
+    bounded = lo_fin & hi_fin
+    one_sided = (lo_fin ^ hi_fin)  # XOR: exactly one finite bound
+
+    log_bounded = (jnp.log((upper - lower) / 2.0)
+                   + jnp.log(jnp.maximum(jnp.abs(jnp.cos(u)), floor)))
+    log_one_sided = (jnp.log(jnp.maximum(jnp.abs(u), floor))
+                     - 0.5 * jnp.log(u * u + 1.0))
+    log_unbounded = jnp.zeros_like(u)
+
+    contrib = jnp.where(bounded, log_bounded,
+                        jnp.where(one_sided, log_one_sided, log_unbounded))
+    return jnp.sum(contrib)
+
+
 def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
                         penalty_settings=None, params_settings=None,
                         constraints=None, extra_params=None):
@@ -485,6 +525,7 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
         lower_np=lower_np, upper_np=upper_np,
         lower=lower, upper=upper,
         Nt=Nt,
+        Pkl_data=Pkl_data, Pkl_var=Pkl_var,
     )
 
 

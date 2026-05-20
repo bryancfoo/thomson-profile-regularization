@@ -2,30 +2,36 @@
 
 Usage
 -----
-    thomson-fit path/to/deck.toml        # after `pip install -e .`
+    thomson-fit path/to/deck.toml                 # after `pip install -e .`
+    thomson-fit path/to/deck.toml --sample        # MAP + posterior sampling
     python thomson_fit.py path/to/deck.toml
-    python thomson_fit.py                # falls back to interactive prompt
+    python thomson_fit.py                         # interactive prompt
 
 The deck schema follows the standard sections consumed by
 ``ThomsonScattering.deck.build_settings_from_deck`` (``[data]``,
 ``[measurement]``, ``[probe_beam]``, ``[params]``, ``[penalty]``, ``[fit]``,
-``[output]``, ``[[extra_params]]``, ``[constraints]``) plus a few extensions
-resolved here before the standard parser runs:
+``[output]``, ``[[extra_params]]``, ``[constraints]``, ``[sampling]``) plus
+a few extensions resolved here before the standard parser runs:
 
   [measurement.throughput_xlsx]   Read xlsx → smooth → interp → throughput[].
   [measurement.irf_hdf4]          Read HDF4 → crop → mean → instr_func_arr[].
   [plotting]                      Save initial-guess, streak, and profile pngs.
 
+The ``--sample`` flag (or ``[sampling].enabled = true`` in the deck) triggers
+multi-chain preconditioned SGLD posterior sampling after the MAP fit; the
+posterior summary lands in the primary HDF5 under ``/summary/``, and an
+optional samples sidecar at ``<output>_samples.h5``.
+
 The deck file's directory is the base for all relative paths it references.
 See ``DECK_API.md`` at the repo root for the full deck schema.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
-# Force float64 BEFORE any other code touches jax.numpy.  Required for the
-# Hessian preconditioner inside the *_nuts fit modes — dual-averaging step
-# sizes routinely shrink past float32's ~1e-38 minimum.
+# Force float64 BEFORE any other code touches jax.numpy. Some downstream
+# operations (e.g. Hessian-preconditioned sampling) need the extra precision.
 import jax as _jax
 _jax.config.update("jax_enable_x64", True)
 
@@ -39,8 +45,9 @@ from ThomsonScattering.deck import (
     load_deck,
     build_settings_from_deck,
     save_fit_results,
+    save_posterior_samples,
 )
-from ThomsonScattering.fitting import run_fit_grad, compute_initial_fit
+from ThomsonScattering.fitting import run_fit_grad, compute_initial_fit, _build_grad_problem
 
 
 # ─── deck preprocessing extensions ─────────────────────────────────────────────
@@ -226,13 +233,87 @@ def _plot_profiles_epw(profiles, time_axis, png_path, shot_num):
     plt.close(fig)
 
 
+# ─── sampling phase ────────────────────────────────────────────────────────────
+
+def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
+                        map_result, sampling_settings):
+    """Run multi-chain SGLD given a finished MAP fit. Returns sampling result."""
+    from ThomsonScattering.sampling import run_sgld_posterior
+
+    problem = _build_grad_problem(
+        Pkl_data, Pkl_var, meas,
+        penalty_settings=pen, params_settings=pars,
+        constraints=constraints, extra_params=extras,
+    )
+    x_phys = np.asarray(map_result.x)
+    u_map = np.array([
+        problem.to_internal_np(x_phys[i], problem.lower_np[i], problem.upper_np[i])
+        for i in range(len(x_phys))
+    ])
+
+    # Map deck fields → run_sgld_posterior kwargs. Defaults match the
+    # function signature except for the temperature sentinel.
+    s = dict(sampling_settings)
+    s.pop("enabled", None)
+    s.pop("samples_path", None)
+    s.pop("save_samples", None)
+    s.pop("save_cross_corr", None)
+    # Temperature default sentinel: "auto" → None inside the sampler
+    if "temperature" not in s:
+        s["temperature"] = None
+    elif s["temperature"] == "auto":
+        s["temperature"] = None
+
+    print("\nRunning SGLD posterior sampling...")
+    samp = run_sgld_posterior(problem, u_map, progress=True, **s)
+    print(
+        f"\nSGLD: {samp.n_chains} chains × {samp.n_samples} samples "
+        f"(burn {samp.burn_in}, thin {samp.thin}) | "
+        f"step={samp.step_size_final:.2e} | T={samp.temperature:.2e}"
+    )
+    print(
+        f"  max R-hat = {samp.max_rhat:.3f} ({samp.max_rhat_key}) | "
+        f"min ESS = {samp.min_ess:.0f} ({samp.min_ess_key}) | "
+        f"wall {samp.wall_time:.1f}s"
+    )
+    if samp.max_rhat > 1.1:
+        print(
+            f"  WARNING: max R-hat = {samp.max_rhat:.2f} > 1.1; "
+            "chains may not have mixed. Consider larger burn_in or "
+            "n_samples, or a different step_size."
+        )
+    if samp.min_ess < 50:
+        print(
+            f"  WARNING: min ESS = {samp.min_ess:.0f} < 50; "
+            "effective sample size is small for at least one coordinate."
+        )
+    return samp
+
+
 # ─── main ──────────────────────────────────────────────────────────────────────
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="thomson-fit",
+        description="Run a Thomson-scattering fit (and optionally posterior "
+                    "sampling) from a TOML input deck.",
+    )
+    parser.add_argument("deck", nargs="?",
+                        help="Path to the input deck (.toml). If omitted, "
+                             "you'll be prompted interactively.")
+    parser.add_argument("--sample", action="store_true",
+                        help="Run multi-chain SGLD posterior sampling after "
+                             "the MAP fit. Overrides [sampling].enabled in "
+                             "the deck if set.")
+    return parser.parse_args(argv)
+
 
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
-    if argv:
-        raw = argv[0]
+    args = _parse_args(argv)
+    if args.deck:
+        raw = args.deck
     else:
         raw = input("Path to input deck (.toml): ").strip()
     deck_path = Path(raw).expanduser().resolve()
@@ -272,6 +353,7 @@ def main(argv=None):
         Pkl_data, Pkl_var,
         meas, pen, pars, fit_kw,
         extras, constraints, out_path,
+        sampling_settings,
     ) = build_settings_from_deck(deck)
 
     print(f"\nRunning fit  Nt={Pkl_data.shape[1]}  Nk={Pkl_data.shape[0]}")
@@ -308,8 +390,27 @@ def main(argv=None):
 
     best_fit_np = np.asarray(best_fit)
 
-    save_fit_results(out_path, result, best_fit_np, deck_text=deck_text, time_axis=time_axis)
+    # ── Optional: posterior sampling ───────────────────────────────────────
+    sampling_result = None
+    do_sample = args.sample or bool(sampling_settings.get("enabled", False))
+    if do_sample:
+        sampling_result = _run_sampling_phase(
+            Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
+            result, sampling_settings,
+        )
+
+    save_cross_corr = bool(sampling_settings.get("save_cross_corr", True))
+    save_fit_results(
+        out_path, result, best_fit_np,
+        deck_text=deck_text, time_axis=time_axis,
+        sampling_result=sampling_result, save_cross_corr=save_cross_corr,
+    )
     print(f"Results saved to: {out_path}")
+
+    if sampling_result is not None and sampling_settings.get("save_samples", True):
+        samples_path = sampling_settings["samples_path"]
+        save_posterior_samples(samples_path, sampling_result)
+        print(f"Posterior samples saved to: {samples_path}")
 
     # Read the per-prefix profiles back for plotting and optional legacy layout.
     with h5py.File(out_path, "r") as hf:

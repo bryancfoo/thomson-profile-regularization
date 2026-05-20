@@ -1,0 +1,133 @@
+# example/fit_deck_constraints_sample.toml — MAP + posterior sampling on the
+# D + C IAW fit. Clone of fit_deck_constraints.toml plus a [sampling] block.
+#
+# Verification target: posterior uncertainties on Te0, Ti0, ifract0 (free)
+# and Ti1 = Ti0, ifract1 = max(floor, 1-ifract0) (constraint-resolved). The
+# ifract1 distribution should show the max-kink whenever 1 - ifract0_floor
+# straddles the floor; SGLD captures that correctly while a Laplace
+# approximation would not.
+#
+# Run:
+#     python example/make_data_iaw.py
+#     thomson-fit example/fit_deck_constraints_sample.toml
+#     # ...or...
+#     thomson-fit example/fit_deck_constraints.toml --sample
+
+[data]
+path        = "data_iaw.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1, 6]
+ion_a            = [2, 12]
+probe_wavelength = 2.6325e-7
+probe_vec        = [0.0,        0.0, 1.0]
+scatter_vec      = [0.8660254,  0.0, 0.5]
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+wavelengths        = "data_iaw.h5:wavelengths"
+normalization_type = "max"
+instr_func_arr     = "data_iaw.h5:irf"
+irf_normalization  = "area"
+throughput         = "data_iaw.h5:throughput"
+
+[params.n]
+value = "data_iaw.h5:ne_true_cm3"
+vary  = false
+
+[params.Te0]
+value = 400.0
+min   = 50.0
+max   = 2000.0
+vary  = true
+
+[params.Ti0]
+value = 300.0
+min   = 50.0
+max   = 1500.0
+vary  = true
+
+[params.ifract0]
+value = 0.5
+min   = 0.01
+max   = 0.99
+vary  = true
+
+[params.efract0]
+value = 1.0
+vary  = false
+
+[params.ue0]
+value = 0.0
+vary  = false
+
+[params.ui0]
+value = 0.0
+vary  = false
+
+[params.ui1]
+value = 0.0
+vary  = false
+
+[params.pe0]
+value = 2.0
+vary  = false
+
+[params.pi0]
+value = 2.0
+vary  = false
+
+[params.pi1]
+value = 2.0
+vary  = false
+
+[[extra_params]]
+name  = "ifract1_floor"
+value = 0.10
+min   = 0.0
+max   = 0.5
+vary  = true
+
+[constraints]
+Ti1     = "Ti0"
+ifract1 = "max(ifract1_floor, 1 - ifract0)"
+
+[fit]
+optimizer        = "sgld_lbfgs"
+max_iter         = 500
+sgld_iter        = 200
+sgld_lr          = 5e-4
+sgld_noise_scale = 0.05
+sgld_noise_decay = 0.55
+sgld_seed        = 0
+tol              = 1e-9
+
+[output]
+path = "fit_result_constraints_sample.h5"
+
+# ── Posterior sampling ─────────────────────────────────────────────────────
+# Temperature defaults to "auto" = 2 / N_pixels_valid, which makes the
+# implicit likelihood the proper Gaussian 0.5 · sum((d - f)² / σ²) and the
+# Tikhonov penalty an implicit prior with strength (N_pix · λ / 2). The
+# MAP location is preserved (uniform scaling of the objective).
+#
+# To sample from the literal -V_fit log-density instead (no Gaussian
+# rescaling), set temperature = "unit" or temperature = 1.0.
+[sampling]
+enabled         = true
+n_samples       = 500
+n_chains        = 4
+burn_in         = 500
+thin            = 1
+temperature     = "auto"        # "auto" | "unit" | float
+step_size       = 0.1
+adapt_step      = true
+adapt_target    = 0.3
+precond         = "diag_hessian"
+perturb_scale   = 1.0
+seed            = 0
+save_samples    = true
+samples_path    = "auto"        # "auto" => fit_result_constraints_sample_samples.h5
+save_cross_corr = true

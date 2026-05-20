@@ -115,6 +115,10 @@ def build_settings_from_deck(deck):
         Mapping of parameter prefix → expression string from the deck's
         ``[constraints]`` table.
     output_path         : pathlib.Path
+    sampling_settings   : dict
+        From the deck's ``[sampling]`` section, with ``samples_path``
+        resolved to an absolute path. Always present; ``enabled = False``
+        when the section is missing.
     """
     base_dir = deck.get("_base_dir", _pathlib.Path("."))
 
@@ -282,6 +286,22 @@ def build_settings_from_deck(deck):
     else:
         output_path = base_dir / out_rel
 
+    # ── [sampling] section ─────────────────────────────────────────────────
+    # Optional posterior-sampling configuration. ``enabled = false`` (default)
+    # means the CLI/run_fit_grad path skips the sampler entirely. The
+    # ``--sample`` CLI flag can also force sampling even when this section
+    # is missing — so we always resolve a default samples_path.
+    samp_raw = deck.get("sampling", None)
+    sampling_settings = dict(samp_raw) if samp_raw is not None else {}
+    sampling_settings.setdefault("enabled", False)
+    s_path = sampling_settings.get("samples_path", "auto")
+    if s_path == "auto":
+        sampling_settings["samples_path"] = (
+            output_path.parent / f"{output_path.stem}_samples.h5"
+        )
+    elif isinstance(s_path, str):
+        sampling_settings["samples_path"] = base_dir / s_path
+
     return (
         Pkl_data, Pkl_var,
         measurement_settings,
@@ -291,16 +311,28 @@ def build_settings_from_deck(deck):
         extra_params,
         constraints_settings,
         output_path,
+        sampling_settings,
     )
 
 
-def save_fit_results(output_path, result, best_fit, deck_text=None, time_axis=None):
+def save_fit_results(output_path, result, best_fit, deck_text=None,
+                     time_axis=None, sampling_result=None,
+                     save_cross_corr=True):
     """Save fit results to an HDF5 file.
 
     Datasets written:
     - ``/best_fit``         : (Nk, Nt) forward model at best-fit params
     - ``/params/<prefix>``  : (Nt,) array per parameter prefix
     - ``/time``             : (Nt,) time array (if provided)
+    - ``/summary/...``      : posterior summary (if ``sampling_result`` given)
+
+    Sampling-result schema under ``/summary/``:
+    - ``mean/<prefix>``, ``std/<prefix>``, ``p16/<prefix>``,
+      ``p50/<prefix>``, ``p84/<prefix>``           — (Nt,)
+    - ``correlations/<prefix>``                    — (Nt, Nt) intra-prefix
+    - ``rhat/<prefix>``, ``ess/<prefix>``          — (Nt,)
+    - ``cross_correlations``                       — (P·Nt, P·Nt), if requested
+
     File-level attributes:
     - ``loss``, ``success``, ``nit``
     - ``deck_toml``         : raw deck text for provenance (if provided)
@@ -322,3 +354,101 @@ def save_fit_results(output_path, result, best_fit, deck_text=None, time_axis=No
         fh.attrs["success"] = bool(result.success)
         if deck_text is not None:
             fh.attrs["deck_toml"] = deck_text
+
+        if sampling_result is not None:
+            _write_sampling_summary(fh, sampling_result,
+                                    save_cross_corr=save_cross_corr)
+
+
+def _write_sampling_summary(fh, samp, *, save_cross_corr=True):
+    """Write the ``/summary/...`` group into an open HDF5 file."""
+    import h5py
+    summary = fh.create_group("summary")
+    for stat in ("mean", "std", "p16", "p50", "p84"):
+        g = summary.create_group(stat)
+        for prefix, s in samp.summary.items():
+            g.create_dataset(prefix, data=_np.asarray(s[stat]))
+    corr_g = summary.create_group("correlations")
+    for prefix, s in samp.summary.items():
+        corr_g.create_dataset(prefix, data=_np.asarray(s["corr_intra"]))
+    rhat_g = summary.create_group("rhat")
+    ess_g = summary.create_group("ess")
+    for prefix in samp.summary:
+        rhat_g.create_dataset(prefix, data=_np.asarray(samp.rhat[prefix]))
+        ess_g.create_dataset(prefix, data=_np.asarray(samp.ess[prefix]))
+    if save_cross_corr:
+        prefixes = list(samp.summary.keys())
+        cols = []
+        for p in prefixes:
+            v = samp.samples_phys[p]
+            cols.append(v.reshape(-1, v.shape[-1]))  # (nc*ns, Nt)
+        flat = _np.concatenate(cols, axis=1)         # (nc*ns, sum Nt)
+        with _np.errstate(divide="ignore", invalid="ignore"):
+            cc = _np.corrcoef(flat.T)
+        cc = _np.where(_np.isfinite(cc), cc, 0.0)
+        _np.fill_diagonal(cc, 1.0)
+        summary.create_dataset("cross_correlations", data=cc)
+        # Index strings so a reader can decode the row/col order.
+        idx_labels = []
+        for p in prefixes:
+            v = samp.samples_phys[p]
+            for t in range(v.shape[-1]):
+                idx_labels.append(f"{p}[t={t}]")
+        summary.create_dataset(
+            "cross_correlations_labels",
+            data=_np.array(idx_labels, dtype=h5py.string_dtype()),
+        )
+
+    summary.attrs["n_chains"]       = int(samp.n_chains)
+    summary.attrs["n_samples"]      = int(samp.n_samples)
+    summary.attrs["burn_in"]        = int(samp.burn_in)
+    summary.attrs["thin"]           = int(samp.thin)
+    summary.attrs["temperature"]    = float(samp.temperature)
+    summary.attrs["step_size_final"] = float(samp.step_size_final)
+    summary.attrs["precond"]        = str(samp.precond)
+    summary.attrs["max_rhat"]       = float(samp.max_rhat)
+    summary.attrs["max_rhat_key"]   = str(samp.max_rhat_key)
+    summary.attrs["min_ess"]        = float(samp.min_ess)
+    summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
+    summary.attrs["wall_time_s"]    = float(samp.wall_time)
+
+
+def save_posterior_samples(output_path, samp):
+    """Save the full posterior-sample sidecar HDF5 from a sampling result.
+
+    Layout:
+    - ``/samples/<prefix>``    : (n_chains, n_samples, Nt) constraint-resolved
+    - ``/u_samples``           : (n_chains, n_samples, D) raw u-space
+    - ``/log_probs``           : (n_chains, n_samples)
+    - ``/step_size_history``   : (burn_in,)
+    - ``/varying_keys``        : (D,) string
+    - ``/u_chain_init``        : (D,)
+    """
+    import h5py  # local import keeps the deck module light at import-time
+
+    output_path = _pathlib.Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(output_path, "w") as fh:
+        samples_grp = fh.create_group("samples")
+        for prefix, arr in samp.samples_phys.items():
+            samples_grp.create_dataset(prefix, data=_np.asarray(arr))
+        fh.create_dataset("u_samples",         data=_np.asarray(samp.u_samples))
+        fh.create_dataset("log_probs",         data=_np.asarray(samp.log_probs))
+        fh.create_dataset("step_size_history", data=_np.asarray(samp.step_size_history))
+        fh.create_dataset("u_chain_init",      data=_np.asarray(samp.u_chain_init))
+        fh.create_dataset(
+            "varying_keys",
+            data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
+        )
+        fh.attrs["n_chains"]       = int(samp.n_chains)
+        fh.attrs["n_samples"]      = int(samp.n_samples)
+        fh.attrs["burn_in"]        = int(samp.burn_in)
+        fh.attrs["thin"]           = int(samp.thin)
+        fh.attrs["temperature"]    = float(samp.temperature)
+        fh.attrs["step_size_final"] = float(samp.step_size_final)
+        fh.attrs["precond"]        = str(samp.precond)
+        fh.attrs["seed"]           = int(samp.seed)
+        fh.attrs["max_rhat"]       = float(samp.max_rhat)
+        fh.attrs["min_ess"]        = float(samp.min_ess)
+        fh.attrs["wall_time_s"]    = float(samp.wall_time)

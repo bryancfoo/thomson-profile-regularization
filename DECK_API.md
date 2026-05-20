@@ -289,6 +289,47 @@ path = "fit_result.h5"
 
 Default (if omitted) is `<deck_stem>_result.h5` next to the deck file.
 
+### `[sampling]` — posterior sampling (optional)
+
+Runs preconditioned SGLD after the MAP fit, producing posterior summary
+statistics and (optionally) a sidecar HDF5 of raw samples. Triggered by
+`enabled = true` here or by the `--sample` CLI flag on `thomson-fit`.
+
+```toml
+[sampling]
+enabled         = true
+n_samples       = 1000        # post-burn-in samples per chain
+n_chains        = 4
+burn_in         = 1000        # iterations before sampling; default = n_samples
+thin            = 1
+temperature     = "auto"      # "auto" | "unit" | positive float
+step_size       = 0.1         # initial; adapted in burn-in if adapt_step
+adapt_step      = true
+adapt_target    = 0.3         # median drift/noise ratio to target
+precond         = "diag_hessian"   # "diag_hessian" | "full_hessian" | "rmsprop" | "identity"
+perturb_scale   = 1.0         # per-chain init offset in posterior-std units
+seed            = 0
+polish_map      = false       # only useful if temperature ≈ 1
+save_samples    = true
+samples_path    = "auto"      # "auto" → <output stem>_samples.h5
+save_cross_corr = true        # write the full (P·Nt × P·Nt) corr matrix
+```
+
+**Temperature semantics.** `"auto"` resolves to `2 / N_pixels_valid`, which
+rescales the user's per-pixel-mean `V_fit = mean(r²/σ²) + Σ λ_o·mean(d_o²)`
+into the proper Gaussian negative log-likelihood `0.5·sum(r²/σ²)` plus an
+implicit prior `Σ (N_pix·λ_o/2)·mean(d_o²)`. The MAP location is preserved
+(uniform scaling). Set `temperature = 1.0` ("unit") to sample from
+`exp(-V_fit + log|J|)` directly — uncertainty intervals then depend on the
+loss convention; rebinning changes their width.
+
+**Outputs.** Posterior summary stats land under `/summary/` in the primary
+HDF5 (means, stds, 16/50/84 percentiles, intra-prefix correlations, R-hat,
+ESS, optional full cross-correlation matrix). Full samples land in the
+sidecar file at `samples_path` (default `<output stem>_samples.h5`). All
+samples are constraint-resolved, so `samples/ifract1` is the physical
+quantity `max(floor, 1 - ifract0)`, not the raw dummy.
+
 ### `[plotting]` (CLI extension, consumed by `thomson_fit.py`)
 
 ```toml
@@ -380,6 +421,35 @@ cmap    = "viridis"
 /params/ifract1_floor      (Nt,)    extra-params written too
 /params/bg0                (Nt,)    background coefs if any
 ...
+```
+
+When posterior sampling ran, an additional `/summary` group is written:
+
+```
+/summary/mean/<prefix>                  (Nt,)        posterior mean
+/summary/std/<prefix>                   (Nt,)        posterior std
+/summary/p16/<prefix>                   (Nt,)
+/summary/p50/<prefix>                   (Nt,)
+/summary/p84/<prefix>                   (Nt,)
+/summary/correlations/<prefix>          (Nt, Nt)     intra-prefix Pearson r
+/summary/rhat/<prefix>                  (Nt,)
+/summary/ess/<prefix>                   (Nt,)
+/summary/cross_correlations             (P·Nt, P·Nt) full matrix (optional)
+/summary/cross_correlations_labels      (P·Nt,) str  row/col labels
+attrs: n_chains, n_samples, burn_in, thin, temperature, step_size_final,
+       precond, max_rhat, min_ess, wall_time_s, ...
+```
+
+A sidecar `<output stem>_samples.h5` (path configurable in `[sampling]`)
+holds the raw chains:
+
+```
+/samples/<prefix>          (n_chains, n_samples, Nt) constraint-resolved
+/u_samples                 (n_chains, n_samples, D)  raw u-space samples
+/log_probs                 (n_chains, n_samples)
+/step_size_history         (burn_in,)
+/varying_keys              (D,) string
+/u_chain_init              (D,)
 ```
 
 File-level attributes:
