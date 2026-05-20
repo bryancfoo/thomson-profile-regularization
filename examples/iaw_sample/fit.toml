@@ -1,4 +1,4 @@
-# example/fit_deck_constraints_sample.toml — MAP + posterior sampling on the
+# examples/iaw_sample/fit.toml — MAP + posterior sampling on the
 # D + C IAW fit. Clone of fit_deck_constraints.toml plus a [sampling] block.
 #
 # Verification target: posterior uncertainties on Te0, Ti0, ifract0 (free)
@@ -8,13 +8,13 @@
 # approximation would not.
 #
 # Run:
-#     python example/make_data_iaw.py
-#     thomson-fit example/fit_deck_constraints_sample.toml
+#     python examples/data/make_data_iaw.py
+#     thomson-fit examples/iaw_sample/fit.toml
 #     # ...or...
-#     thomson-fit example/fit_deck_constraints.toml --sample
+#     thomson-fit examples/iaw_constraints/fit.toml --sample
 
 [data]
-path        = "data_iaw.h5"
+path        = "../data/data_iaw.h5"
 pkl_dataset = "Pkl_data"
 var_dataset = "Pkl_var"
 
@@ -27,14 +27,14 @@ probe_vec        = [0.0,        0.0, 1.0]
 scatter_vec      = [0.8660254,  0.0, 0.5]
 ue_dir           = [1.0, 0.0, 0.0]
 ui_dir           = [1.0, 0.0, 0.0]
-wavelengths        = "data_iaw.h5:wavelengths"
+wavelengths        = "../data/data_iaw.h5:wavelengths"
 normalization_type = "max"
-instr_func_arr     = "data_iaw.h5:irf"
+instr_func_arr     = "../data/data_iaw.h5:irf"
 irf_normalization  = "area"
-throughput         = "data_iaw.h5:throughput"
+throughput         = "../data/data_iaw.h5:throughput"
 
 [params.n]
-value = "data_iaw.h5:ne_true_cm3"
+value = "../data/data_iaw.h5:ne_true_cm3"
 vary  = false
 
 [params.Te0]
@@ -105,7 +105,7 @@ sgld_seed        = 0
 tol              = 1e-9
 
 [output]
-path = "fit_result_constraints_sample.h5"
+path = "fit_result.h5"
 
 # ── Posterior sampling ─────────────────────────────────────────────────────
 # Temperature defaults to "auto" = 2 / N_pixels_valid, which makes the

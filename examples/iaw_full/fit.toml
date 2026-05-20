@@ -1,4 +1,4 @@
-# example/fit_deck_full.toml — "kitchen sink" deck exercising every
+# examples/iaw_full/fit.toml — "kitchen sink" deck exercising every
 # optional feature of the deck API on the D+C IAW data:
 #
 #   * [probe_beam]      SRS/SBS gain correction (Turnbull et al., PRL 2026)
@@ -10,11 +10,11 @@
 #   * adam optimizer    (good for cases where LBFGS line search struggles)
 #
 # Run:
-#     python example/make_data_iaw.py
-#     thomson-fit example/fit_deck_full.toml
+#     python examples/data/make_data_iaw.py
+#     thomson-fit examples/iaw_full/fit.toml
 
 [data]
-path        = "data_iaw.h5"
+path        = "../data/data_iaw.h5"
 pkl_dataset = "Pkl_data"
 var_dataset = "Pkl_var"
 
@@ -27,15 +27,15 @@ probe_vec          = [0.0,        0.0, 1.0]
 scatter_vec        = [0.8660254,  0.0, 0.5]
 ue_dir             = [1.0, 0.0, 0.0]
 ui_dir             = [1.0, 0.0, 0.0]
-wavelengths        = "data_iaw.h5:wavelengths"
+wavelengths        = "../data/data_iaw.h5:wavelengths"
 normalization_type = "max"
 
 # Per-time IRF (Nk, Nt) — Gaussian FWHM ≈ 25 pm baked into data_iaw.h5.
-instr_func_arr     = "data_iaw.h5:irf"
+instr_func_arr     = "../data/data_iaw.h5:irf"
 irf_normalization  = "area"
 
 # Wavelength-dependent throughput (Nk,) — newline-separated CSV.
-throughput         = "throughput.csv"
+throughput         = "../data/throughput.csv"
 
 # Mask a narrow band around the probe line.  Real spectrometers often have
 # stray-light contamination from the residual probe; setting notch removes
@@ -60,7 +60,7 @@ gain_mode           = "off"
 # ── Free parameters: Te0, Ti0 (D), ifract0 (D). ─────────────────────────────
 # Ti1 = Ti0 and ifract1 = 1 - ifract0 set by [constraints]; n fixed.
 [params.n]
-value = "data_iaw.h5:ne_true_cm3"
+value = "../data/data_iaw.h5:ne_true_cm3"
 vary  = false
 
 [params.Te0]
@@ -127,14 +127,14 @@ ifract1 = "1 - ifract0"
 # lambda_weights = [L0, L1, L2] penalize 0th / 1st / 2nd time derivatives.
 # relative = true rescales each derivative by the local parameter magnitude.
 [penalty.Te0]
-profile_axis   = "data_iaw.h5:time"
+profile_axis   = "../data/data_iaw.h5:time"
 lambda_weights = [0.0, 0.5, 0.2]
 thresholds     = [0.0, 0.0, 0.0]
 relative       = true
 monotonic      = 0
 
 [penalty.Ti0]
-profile_axis   = "data_iaw.h5:time"
+profile_axis   = "../data/data_iaw.h5:time"
 lambda_weights = [0.0, 0.5, 0.2]
 thresholds     = [0.0, 0.0, 0.0]
 relative       = true
@@ -148,4 +148,4 @@ max_iter  = 1500
 tol       = 1e-8
 
 [output]
-path = "fit_result_full.h5"
+path = "fit_result.h5"

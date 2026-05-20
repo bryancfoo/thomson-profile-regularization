@@ -29,23 +29,28 @@ Both also accept being called via `python thomson_fit.py ...` /
 `python thomson_forward.py ...`, and both fall back to an interactive
 prompt when no argument is provided.
 
-Three example decks live under [`example/`](example/):
+Examples live under [`examples/`](examples/), one subdirectory per deck:
 
-| Deck | Demonstrates |
+| Directory | Demonstrates |
 |---|---|
-| [`example/fit_deck.toml`](example/fit_deck.toml) | minimal antiStokes-EPW fit, single ion, LBFGS |
-| [`example/fit_deck_constraints.toml`](example/fit_deck_constraints.toml) | multi-ion IAW + `[constraints]` + `[[extra_params]]` + SGLD→LBFGS |
-| [`example/fit_deck_full.toml`](example/fit_deck_full.toml) | "kitchen sink": IRF + throughput + `notch` + `background_order` + `[probe_beam]` + `[penalty.*]` + Adam |
+| [`examples/epw_basic/`](examples/epw_basic/) | minimal antiStokes-EPW fit, single ion, LBFGS |
+| [`examples/forward_only/`](examples/forward_only/) | forward model from `[profiles]`, no fitting |
+| [`examples/iaw_constraints/`](examples/iaw_constraints/) | multi-ion IAW + `[constraints]` + `[[extra_params]]` + SGLD→LBFGS |
+| [`examples/iaw_sample/`](examples/iaw_sample/) | same as `iaw_constraints` plus posterior sampling |
+| [`examples/iaw_full/`](examples/iaw_full/) | "kitchen sink": IRF + throughput + `notch` + `background_order` + `[probe_beam]` + `[penalty.*]` + Adam |
 
-Run them in order:
+Generate the shared synthetic data, then run any example:
 
 ```bash
-python example/make_data.py        # generates example/data.h5 (EPW)
-python example/make_data_iaw.py    # generates example/data_iaw.h5 (IAW, used by decks 2 & 3)
-thomson-fit example/fit_deck.toml
-thomson-fit example/fit_deck_constraints.toml
-thomson-fit example/fit_deck_full.toml
+python examples/data/make_data_epw.py     # → examples/data/data_epw.h5
+python examples/data/make_data_iaw.py     # → examples/data/data_iaw.h5  +  throughput.csv
+
+cd examples/epw_basic && thomson-fit fit.toml && python plot.py
+cd examples/iaw_sample && thomson-fit fit.toml && python plot.py    # error bands rendered from posterior
 ```
+
+Each subdir has its own `plot.py` that auto-detects the `/summary/` group
+in `fit_result.h5` and overlays 16/84-percentile error bands when present.
 
 ---
 
@@ -515,34 +520,39 @@ save_fit_results(out_path, result, best_fit, time_axis=meas.get("time"))
 
 ## 7. Provided examples — quick reference
 
-[`example/make_data.py`](example/make_data.py) generates
-[`example/data.h5`](example/data.h5): a clean single-ion antiStokes-EPW
-streak (200 wavelengths × 10 time steps), no IRF or throughput baked in.
+Shared synthetic data lives under [`examples/data/`](examples/data/):
 
-[`example/make_data_iaw.py`](example/make_data_iaw.py) generates
-[`example/data_iaw.h5`](example/data_iaw.h5): a D + C IAW streak
-(200 wavelengths × 10 time steps) with a Gaussian IRF (FWHM ≈ 25 pm) and
-a wavelength-dependent throughput envelope baked in. The same throughput
-is also written to [`example/throughput.csv`](example/throughput.csv).
+- [`make_data_epw.py`](examples/data/make_data_epw.py) →
+  [`data_epw.h5`](examples/data/data_epw.h5): a clean single-ion
+  antiStokes-EPW streak (200 wavelengths × 10 time steps), no IRF or
+  throughput baked in.
+- [`make_data_iaw.py`](examples/data/make_data_iaw.py) →
+  [`data_iaw.h5`](examples/data/data_iaw.h5): a D + C IAW streak
+  (200 wavelengths × 10 time steps) with a Gaussian IRF (FWHM ≈ 25 pm)
+  and a wavelength-dependent throughput envelope baked in. The same
+  throughput is also written to
+  [`throughput.csv`](examples/data/throughput.csv).
 
-The three fit decks use:
+The five example subdirectories, each with its own `fit.toml`/`forward.toml`,
+`plot.py`, and a per-example `README.md`:
 
-- **deck 1**, [`example/fit_deck.toml`](example/fit_deck.toml): `data.h5`,
-  no IRF/throughput. Free params: `n`, `Te0`. Optimizer: LBFGS.
-- **deck 2**, [`example/fit_deck_constraints.toml`](example/fit_deck_constraints.toml):
-  `data_iaw.h5`, applies `instr_func_arr` and `throughput` (both loaded
-  from the HDF5 file). Free params: `Te0`, `Ti0`, `ifract0`,
-  `ifract1_floor`. `[constraints]` sets `Ti1 = Ti0` and `ifract1 =
-  max(ifract1_floor, 1 - ifract0)`. Optimizer: SGLD → LBFGS.
-- **deck 3**, [`example/fit_deck_full.toml`](example/fit_deck_full.toml):
-  `data_iaw.h5`, applies IRF (from HDF5), throughput (from CSV — same
-  numbers as the HDF5 version, demonstrating the CSV file-loading path),
-  `notch`, `background_order = 1`, `[probe_beam]` (with `gain_mode =
-  "off"` so the section is parsed but the correction is disabled), and
+- [`examples/epw_basic/`](examples/epw_basic/) — `data_epw.h5`, no IRF /
+  throughput. Free params: `n`, `Te0`. Optimizer: LBFGS.
+- [`examples/forward_only/`](examples/forward_only/) — pairs with
+  `data_epw.h5`; recomputes the synthetic EPW streak directly from the
+  deck's `[profiles]` block, useful for sanity-checking that geometry /
+  wavelength window agree with the fitter's view.
+- [`examples/iaw_constraints/`](examples/iaw_constraints/) — `data_iaw.h5`,
+  applies `instr_func_arr` and `throughput` (both from HDF5). Free params:
+  `Te0`, `Ti0`, `ifract0`, `ifract1_floor`. `[constraints]` sets
+  `Ti1 = Ti0` and `ifract1 = max(ifract1_floor, 1 - ifract0)`.
+  Optimizer: SGLD → LBFGS.
+- [`examples/iaw_sample/`](examples/iaw_sample/) — identical physics to
+  `iaw_constraints` plus a `[sampling]` block that triggers preconditioned
+  SGLD posterior sampling after the MAP. Produces 16/84-percentile bands
+  in `plot.py` for free.
+- [`examples/iaw_full/`](examples/iaw_full/) — `data_iaw.h5`, applies IRF
+  (from HDF5), throughput (from CSV — demonstrating the file-loading path),
+  `notch`, `background_order = 1`, `[probe_beam]` (with `gain_mode = "off"`
+  so the section is parsed but the correction is disabled), and
   `[penalty.*]` Tikhonov terms. Optimizer: Adam.
-
-The single forward deck
-[`example/forward_deck.toml`](example/forward_deck.toml) pairs with
-`data.h5`: recomputes the synthetic EPW streak directly from the
-profiles, useful for sanity-checking that geometry / wavelength window
-agree with the fitter's view.

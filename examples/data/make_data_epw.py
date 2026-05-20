@@ -1,14 +1,14 @@
-"""Generate data.h5 for the minimal antiStokes EPW fit example.
+"""Generate data_epw.h5 for the EPW examples.
 
 Run from anywhere (paths are resolved relative to this script):
 
-    python example/make_data.py
+    python examples/data/make_data_epw.py
 
-The output, ``example/data.h5``, contains a synthetic time-resolved
+The output, ``examples/data/data_epw.h5``, contains a synthetic time-resolved
 Thomson scattering streak in the antiStokes EPW window for a 263.25 nm
 probe with 60° scattering.  Only ne and Te vary with time; everything
-else is held fixed.  Used by ``example/forward_deck.toml`` and
-``example/fit_deck.toml``.
+else is held fixed.  Used by ``examples/forward_only/forward.toml`` and
+``examples/epw_basic/fit.toml``.
 """
 from pathlib import Path
 
@@ -18,7 +18,7 @@ from scipy.constants import e, k as kB
 
 from ThomsonScattering.forward import scattered_power_wavelength
 
-OUT = Path(__file__).resolve().parent / "data.h5"
+OUT = Path(__file__).resolve().parent / "data_epw.h5"
 
 # ── Geometry: 263.25 nm probe, 60° scattering ────────────────────────────────
 # Codebase convention: wavelengths and probe_wavelength are in METERS.  We

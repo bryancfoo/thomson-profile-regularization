@@ -1,10 +1,10 @@
-# example/forward_deck.toml — minimal antiStokes EPW forward model
+# examples/forward_only/forward.toml — minimal antiStokes EPW forward model
 #
-# Re-computes the synthetic spectrum stored in example/data.h5 directly from
+# Re-computes the synthetic spectrum stored in examples/data/data_epw.h5 directly from
 # the deck's [profiles] block.  Use this to sanity-check that the data file,
 # wavelength window, and geometry agree with the fitter's view of the model.
 #
-#     python thomson_forward.py example/forward_deck.toml
+#     python thomson_forward.py examples/forward_only/forward.toml
 #
 # Probe:        263.25 nm
 # Scattering:   60° between probe and detector directions
@@ -55,7 +55,7 @@ ui_dir           = [1.0, 0.0, 0.0]
 
 # antiStokes EPW window (Nk=200).  Wider than strictly needed so the line is
 # well inside the window across the full Te / ne sweep.
-wavelengths = "data.h5:wavelengths"
+wavelengths = "../data/data_epw.h5:wavelengths"
 
 normalization_type = "max"
 

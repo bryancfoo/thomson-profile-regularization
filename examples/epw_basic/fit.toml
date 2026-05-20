@@ -1,17 +1,17 @@
-# example/fit_deck.toml — minimal LBFGS → NUTS fit of the antiStokes EPW
+# examples/epw_basic/fit.toml — minimal LBFGS → NUTS fit of the antiStokes EPW
 #
-# Pairs with example/data.h5 (built by example/make_data.py) and
-# example/forward_deck.toml.  Only ne and Te are free — small enough
+# Pairs with examples/data/data_epw.h5 (built by examples/data/make_data_epw.py) and
+# examples/forward_only/forward.toml.  Only ne and Te are free — small enough
 # (20 free parameters) that LBFGS converges in seconds and NUTS warmup
 # finishes quickly, so it's the right test case to verify the *_nuts
 # pipeline end-to-end on your system.
 #
 # Run:
-#     python example/make_data.py            # one-time: generate data.h5
-#     python thomson_fit.py example/fit_deck.toml
+#     python examples/data/make_data_epw.py            # one-time: generate data_epw.h5
+#     python thomson_fit.py examples/epw_basic/fit.toml
 
 [data]
-path        = "data.h5"
+path        = "../data/data_epw.h5"
 pkl_dataset = "Pkl_data"
 var_dataset = "Pkl_var"
 
@@ -25,7 +25,7 @@ probe_vec        = [0.0,        0.0, 1.0]
 scatter_vec      = [0.8660254,  0.0, 0.5]   # 60° from probe in x-z plane
 ue_dir           = [1.0, 0.0, 0.0]
 ui_dir           = [1.0, 0.0, 0.0]
-wavelengths      = "data.h5:wavelengths"
+wavelengths      = "../data/data_epw.h5:wavelengths"
 normalization_type = "max"
 
 # ── Free parameters: just n and Te0.  Everything else is fixed. ──────────────

@@ -2,9 +2,9 @@
 
 Run from anywhere (paths resolved relative to this script):
 
-    python example/make_data_iaw.py
+    python examples/data/make_data_iaw.py
 
-Produces ``example/data_iaw.h5`` with:
+Produces ``examples/data/data_iaw.h5`` with:
 - ``Pkl_data`` (Nk, Nt)        : noisy scattered power
 - ``Pkl_var``  (Nk, Nt)        : variance per pixel
 - ``wavelengths`` (Nk,) meters : 262.6–263.9 nm window covering both IAW pairs
@@ -13,9 +13,10 @@ Produces ``example/data_iaw.h5`` with:
 - ``ne_true_cm3, Te_true_eV, Ti_true_eV, ifrac_D_true, ifrac_C_true`` :
   ground-truth profiles for sanity-checking the recovered fit.
 
-The data exercises features needed by ``fit_deck_constraints.toml`` (multi-ion
-sum-to-one constraint) and ``fit_deck_full.toml`` (probe-beam gain correction,
-background, IRF, notch, throughput).
+The data exercises features needed by ``examples/iaw_constraints/fit.toml``
+(multi-ion sum-to-one constraint), ``examples/iaw_sample/fit.toml`` (same
+plus posterior sampling), and ``examples/iaw_full/fit.toml`` (probe-beam
+gain correction, background, IRF, notch, throughput).
 """
 from pathlib import Path
 

@@ -1,4 +1,4 @@
-# example/fit_deck_constraints.toml — D + C IAW fit with [constraints] and
+# examples/iaw_constraints/fit.toml — D + C IAW fit with [constraints] and
 # [[extra_params]].  Demonstrates:
 #
 #   * multi-ion (D + C) fit on the IAW data
@@ -9,11 +9,11 @@
 #   * sgld_lbfgs optimizer (SGLD warmup → LBFGS refinement)
 #
 # Run:
-#     python example/make_data_iaw.py          # one-time: generate data_iaw.h5
-#     python thomson_fit.py example/fit_deck_constraints.toml
+#     python examples/data/make_data_iaw.py          # one-time: generate data_iaw.h5
+#     python thomson_fit.py examples/iaw_constraints/fit.toml
 
 [data]
-path        = "data_iaw.h5"
+path        = "../data/data_iaw.h5"
 pkl_dataset = "Pkl_data"
 var_dataset = "Pkl_var"
 
@@ -26,21 +26,21 @@ probe_vec        = [0.0,        0.0, 1.0]
 scatter_vec      = [0.8660254,  0.0, 0.5]    # 60° from probe in x–z plane
 ue_dir           = [1.0, 0.0, 0.0]
 ui_dir           = [1.0, 0.0, 0.0]
-wavelengths        = "data_iaw.h5:wavelengths"
+wavelengths        = "../data/data_iaw.h5:wavelengths"
 normalization_type = "max"
 # Per-time Gaussian IRF (FWHM ≈ 25 pm) baked into data_iaw.h5.
-instr_func_arr     = "data_iaw.h5:irf"
+instr_func_arr     = "../data/data_iaw.h5:irf"
 irf_normalization  = "area"
 # Wavelength-dependent throughput, also baked into data_iaw.h5.  (Deck 3
 # loads the same array from a CSV to demonstrate the other file format.)
-throughput         = "data_iaw.h5:throughput"
+throughput         = "../data/data_iaw.h5:throughput"
 
 # ── Free parameters: Te0, Ti0 (D), ifract0 (D). ─────────────────────────────
 # Ti1 (C) and ifract1 (C) are NOT listed here — they're set by [constraints].
 # n is fixed: under normalization_type="max" the IAW lineshape doesn't
 # constrain absolute density well; for ne recovery use an EPW window instead.
 [params.n]
-value = "data_iaw.h5:ne_true_cm3"  # array-valued init from truth
+value = "../data/data_iaw.h5:ne_true_cm3"  # array-valued init from truth
 vary  = false
 
 [params.Te0]
@@ -120,4 +120,4 @@ sgld_seed        = 0
 tol              = 1e-9
 
 [output]
-path = "fit_result_constraints.h5"
+path = "fit_result.h5"
