@@ -8,16 +8,14 @@ import jax as _jax
 _jax.config.update("jax_enable_x64", True)
 
 from .deck import (
-    load_deck, build_settings_from_deck,
-    save_fit_results, save_posterior_samples,
+    load_deck, build_settings_from_deck, save_fit_results,
 )
 from .fitting import run_fit_grad, build_params, compute_initial_fit, Param
 from .forward import scattered_power_wavelength, spectral_density
 from .sampling import build_sampling_problem, run_sgld_posterior
 
 __all__ = [
-    "load_deck", "build_settings_from_deck",
-    "save_fit_results", "save_posterior_samples",
+    "load_deck", "build_settings_from_deck", "save_fit_results",
     "run_fit_grad", "build_params", "compute_initial_fit", "Param",
     "scattered_power_wavelength", "spectral_density",
     "build_sampling_problem", "run_sgld_posterior",

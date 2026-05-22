@@ -125,14 +125,66 @@ def build_sampling_problem(problem, *, temperature=None):
 
 # ─── preconditioner ─────────────────────────────────────────────────────────
 
-def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6):
+def _diag_hessian_fd(problem_s, u_ref, *, h=1e-4):
+    """Diagonal Hessian via central finite differences of the gradient.
+
+    Avoids JAX's 2nd-derivative rules entirely — works when the forward
+    model contains operators whose Hessian isn't implemented (e.g.
+    ``gammaincc`` w.r.t. its first argument, which trips a
+    ``NotImplementedError: igamma_grad_a`` when ``pe``/``pi`` are free).
+
+    Cost: 2·D jitted gradient evaluations. One-time at sampler setup.
+    """
+    D = int(u_ref.shape[0])
+    grad_fn = lambda u: problem_s.target_log_prob_and_grad(u)[1]
+    h_diag = np.zeros(D, dtype=np.float64)
+    for j in range(D):
+        e = jnp.zeros(D, dtype=u_ref.dtype).at[j].set(h)
+        gp = np.asarray(grad_fn(u_ref + e))
+        gm = np.asarray(grad_fn(u_ref - e))
+        h_diag[j] = (gp[j] - gm[j]) / (2 * h)
+    return jnp.asarray(h_diag)
+
+
+def _full_hessian_fd(problem_s, u_ref, *, h=1e-4):
+    """Full Hessian via central finite differences of the gradient.
+
+    Same idea as :func:`_diag_hessian_fd` but builds the dense matrix.
+    Cost: 2·D jitted gradient evaluations.
+    """
+    D = int(u_ref.shape[0])
+    grad_fn = lambda u: problem_s.target_log_prob_and_grad(u)[1]
+    H = np.zeros((D, D), dtype=np.float64)
+    for j in range(D):
+        e = jnp.zeros(D, dtype=u_ref.dtype).at[j].set(h)
+        gp = np.asarray(grad_fn(u_ref + e))
+        gm = np.asarray(grad_fn(u_ref - e))
+        H[:, j] = (gp - gm) / (2 * h)
+    return jnp.asarray(0.5 * (H + H.T))
+
+
+def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
+                                fallback=1.0):
     """Diagonal preconditioner from |H(target_log_prob)(u_ref)|.
 
     Returns ``M_diag`` of shape (D,) with ``M_diag[i] = 1 / max(|H_ii|, floor)``.
+
+    Tries JAX's analytical Hessian first; falls back to a 1st-derivative
+    finite-difference diagonal when JAX hits a missing 2nd-derivative rule
+    (e.g. ``gammaincc`` w.r.t. ``a`` with free ``pe``/``pi``). Non-finite
+    entries are replaced with ``fallback`` so a single bad coordinate
+    doesn't NaN the entire preconditioner.
     """
-    H = _jax.hessian(problem_s.target_log_prob)(u_ref)
-    h_diag = jnp.abs(jnp.diag(H))
-    return 1.0 / jnp.maximum(h_diag, floor)
+    try:
+        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+        h_diag = jnp.abs(jnp.diag(H))
+    except NotImplementedError as err:
+        print(f"  [precond=diag_hessian] analytical Hessian unavailable "
+              f"({err}); falling back to finite-difference diagonal.")
+        h_diag = jnp.abs(_diag_hessian_fd(problem_s, u_ref))
+    h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
+    M = 1.0 / jnp.maximum(h_diag, floor)
+    return jnp.where(jnp.isfinite(M), M, 1.0)
 
 
 def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6):
@@ -142,9 +194,17 @@ def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6):
     preconditioner is well-defined even where the Hessian has saddle-point
     directions. Returns ``(M_matrix, L_chol)`` for SGLD's noise step
     (``L_chol L_chol^T = M``).
+
+    Falls back to finite-difference Hessian when JAX's analytical 2nd
+    derivatives aren't supported for the forward model.
     """
-    H = _jax.hessian(problem_s.target_log_prob)(u_ref)
-    # symmetric eigendecomposition; |λ| gives SPD ≈ -H for sampling-target convention
+    try:
+        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+    except NotImplementedError as err:
+        print(f"  [precond=full_hessian] analytical Hessian unavailable "
+              f"({err}); falling back to finite-difference Hessian.")
+        H = _full_hessian_fd(problem_s, u_ref)
+    H = jnp.where(jnp.isfinite(H), H, 0.0)
     w, V = jnp.linalg.eigh(0.5 * (H + H.T))
     w_abs = jnp.maximum(jnp.abs(w), 0.0) + reg
     M = (V * (1.0 / w_abs)) @ V.T

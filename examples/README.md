@@ -24,7 +24,7 @@ python examples/data/make_data_iaw.py     # → data_iaw.h5  +  throughput.csv
 
 ```bash
 cd examples/iaw_sample
-thomson-fit fit.toml             # writes fit_result.h5 (+ fit_result_samples.h5 here)
+thomson-fit fit.toml             # writes fit_result.h5 (incl. /summary and /samples when sampling ran)
 python plot.py                   # writes params_vs_time.png and spectra.png
 ```
 

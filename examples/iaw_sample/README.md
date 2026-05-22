@@ -5,7 +5,7 @@ Same physics deck as [`../iaw_constraints/`](../iaw_constraints/) but with a
 
 ```bash
 python examples/data/make_data_iaw.py   # one-time
-thomson-fit fit.toml                    # writes fit_result.h5 (+ fit_result_samples.h5)
+thomson-fit fit.toml                    # writes fit_result.h5 with /summary/ and /samples/
 python plot.py                          # error bands rendered from posterior
 ```
 
@@ -15,5 +15,8 @@ on each parameter trajectory. Constraint-resolved samples mean the
 `ifract1` band reflects the *physical* quantity
 `max(ifract1_floor, 1 - ifract0)`, not the raw dummy.
 
-The full chains land in `fit_result_samples.h5` (a few MB) for downstream
-analysis — see [DECK_API.md §5](../../DECK_API.md) for the schema.
+The full chains are under `/samples/<prefix>` (constraint-resolved) and
+`/u_samples` (raw u-space) in the same `fit_result.h5`. See
+[DECK_API.md §5](../../DECK_API.md) for the schema. Set
+`[sampling] save_samples = false` to drop the chains and keep only the
+summary.

@@ -10,7 +10,7 @@ build/
 # Generated artifacts under examples/
 examples/data/data_epw.h5
 examples/data/data_iaw.h5
-examples/*/fit_result*.h5
+examples/*/fit_result.h5
 examples/*/*.png
 
 # Generated plots at the repo root

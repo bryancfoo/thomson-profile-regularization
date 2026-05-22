@@ -168,6 +168,12 @@ max   = 5000.0      # upper bound (default: +inf)
 vary  = true        # free / fixed flag
 ```
 
+**Super-Gaussian exponents (`pe`, `pi`)** are interpolated from a table
+spanning `p ∈ [2.0, 5.0]`; values below 2.0 are extrapolated and produce
+silent NaN in the forward model. The deck loader rejects `min < 2.0` on
+any `pe<…>` / `pi<…>` key (prefix-level, species-level, or per-time-step)
+so this can't slip through unnoticed.
+
 **Array warm starts.** Supply an array reference for `value` to set
 distinct initial guesses per time step:
 
@@ -296,9 +302,10 @@ Default (if omitted) is `<deck_stem>_result.h5` next to the deck file.
 
 ### `[sampling]` — posterior sampling (optional)
 
-Runs preconditioned SGLD after the MAP fit, producing posterior summary
-statistics and (optionally) a sidecar HDF5 of raw samples. Triggered by
-`enabled = true` here or by the `--sample` CLI flag on `thomson-fit`.
+Runs preconditioned SGLD after the MAP fit. Summary statistics and the
+raw chains both land in the primary HDF5 (set `save_samples = false` to
+drop the chains). Triggered by `enabled = true` here or by the `--sample`
+CLI flag on `thomson-fit`.
 
 ```toml
 [sampling]
@@ -315,8 +322,7 @@ precond         = "diag_hessian"   # "diag_hessian" | "full_hessian" | "rmsprop"
 perturb_scale   = 1.0         # per-chain init offset in posterior-std units
 seed            = 0
 polish_map      = false       # only useful if temperature ≈ 1
-save_samples    = true
-samples_path    = "auto"      # "auto" → <output stem>_samples.h5
+save_samples    = true        # write raw chains into the main HDF5
 save_cross_corr = true        # write the full (P·Nt × P·Nt) corr matrix
 ```
 
@@ -328,12 +334,15 @@ implicit prior `Σ (N_pix·λ_o/2)·mean(d_o²)`. The MAP location is preserved
 `exp(-V_fit + log|J|)` directly — uncertainty intervals then depend on the
 loss convention; rebinning changes their width.
 
-**Outputs.** Posterior summary stats land under `/summary/` in the primary
-HDF5 (means, stds, 16/50/84 percentiles, intra-prefix correlations, R-hat,
-ESS, optional full cross-correlation matrix). Full samples land in the
-sidecar file at `samples_path` (default `<output stem>_samples.h5`). All
-samples are constraint-resolved, so `samples/ifract1` is the physical
-quantity `max(floor, 1 - ifract0)`, not the raw dummy.
+**Outputs.** Everything lands in the primary HDF5 (`[output] path`):
+posterior summary statistics under `/summary/` (means, stds, 16/50/84
+percentiles, intra-prefix correlations, R-hat, ESS, optional full
+cross-correlation matrix) and the raw chains under `/samples/<prefix>` +
+`/u_samples` + `/log_probs` + `/step_size_history` + `/u_chain_init` +
+`/varying_keys`. Set `save_samples = false` to keep only the `/summary/`
+group and drop the raw chains (much smaller file). All samples are
+constraint-resolved, so `samples/ifract1` is the physical quantity
+`max(floor, 1 - ifract0)`, not the raw dummy.
 
 ### `[plotting]` (CLI extension, consumed by `thomson_fit.py`)
 
@@ -388,8 +397,8 @@ Te     = [...]                   # (Nelectrons, Nt) or (Nt,) eV
 Ti     = [...]                   # (Nions, Nt) eV
 ue     = [...]                   # m/s
 ui     = [...]                   # (Nions, Nt) m/s
-pe     = [...]                   # super-Gaussian exponent
-pi     = [...]                   # (Nions, Nt) super-Gaussian exponent
+pe     = [...]                   # super-Gaussian exponent, must be ≥ 2.0
+pi     = [...]                   # (Nions, Nt) super-Gaussian exponent, must be ≥ 2.0
 efract = [...]
 ifract = [...]                   # (Nions, Nt) — should sum to 1 over ions
 
@@ -445,8 +454,8 @@ attrs: n_chains, n_samples, burn_in, thin, temperature, step_size_final,
        precond, max_rhat, min_ess, wall_time_s, ...
 ```
 
-A sidecar `<output stem>_samples.h5` (path configurable in `[sampling]`)
-holds the raw chains:
+When sampling ran and `save_samples = true` (the default), the raw chains
+land in the same file as the summary:
 
 ```
 /samples/<prefix>          (n_chains, n_samples, Nt) constraint-resolved
@@ -456,6 +465,9 @@ holds the raw chains:
 /varying_keys              (D,) string
 /u_chain_init              (D,)
 ```
+
+Set `[sampling] save_samples = false` to drop these and keep only the
+`/summary/` group.
 
 File-level attributes:
 

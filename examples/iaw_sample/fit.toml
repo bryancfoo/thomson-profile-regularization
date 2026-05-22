@@ -128,6 +128,5 @@ adapt_target    = 0.3
 precond         = "diag_hessian"
 perturb_scale   = 1.0
 seed            = 0
-save_samples    = true
-samples_path    = "auto"        # "auto" => fit_result_constraints_sample_samples.h5
+save_samples    = true          # write raw chains into the main HDF5
 save_cross_corr = true

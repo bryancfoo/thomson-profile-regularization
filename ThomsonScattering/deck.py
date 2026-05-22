@@ -116,9 +116,8 @@ def build_settings_from_deck(deck):
         ``[constraints]`` table.
     output_path         : pathlib.Path
     sampling_settings   : dict
-        From the deck's ``[sampling]`` section, with ``samples_path``
-        resolved to an absolute path. Always present; ``enabled = False``
-        when the section is missing.
+        From the deck's ``[sampling]`` section. Always present;
+        ``enabled = False`` when the section is missing.
     """
     base_dir = deck.get("_base_dir", _pathlib.Path("."))
 
@@ -244,6 +243,20 @@ def build_settings_from_deck(deck):
         if _per_time_re.match(key):
             params_settings[key] = dict(kw)
 
+    # Super-Gaussian exponents pe / pi are sampled through _Zprime, which
+    # interpolates from a precomputed table covering p ∈ [2.0, 5.0]. Below
+    # 2.0 the forward model silently extrapolates and produces NaN. Refuse
+    # bounds that allow that, so a user typo doesn't quietly poison a long fit.
+    _p_key_re = _re.compile(r"^p[ei](\d+(?:_\d+)?)?$|^p[ei]$")
+    for key, kw in params_settings.items():
+        if _p_key_re.match(key) and "min" in kw:
+            if float(kw["min"]) < 2.0:
+                raise ValueError(
+                    f"[params.{key}] min = {kw['min']!r} is below 2.0. The "
+                    f"super-Gaussian exponent table covers p ∈ [2.0, 5.0]; "
+                    f"values below 2.0 cause silent NaN in the forward model."
+                )
+
     params_settings = params_settings or None
 
     # ── 4. Build penalty_settings (load profile_axis arrays) ────────────────
@@ -290,17 +303,10 @@ def build_settings_from_deck(deck):
     # Optional posterior-sampling configuration. ``enabled = false`` (default)
     # means the CLI/run_fit_grad path skips the sampler entirely. The
     # ``--sample`` CLI flag can also force sampling even when this section
-    # is missing — so we always resolve a default samples_path.
+    # is missing.
     samp_raw = deck.get("sampling", None)
     sampling_settings = dict(samp_raw) if samp_raw is not None else {}
     sampling_settings.setdefault("enabled", False)
-    s_path = sampling_settings.get("samples_path", "auto")
-    if s_path == "auto":
-        sampling_settings["samples_path"] = (
-            output_path.parent / f"{output_path.stem}_samples.h5"
-        )
-    elif isinstance(s_path, str):
-        sampling_settings["samples_path"] = base_dir / s_path
 
     return (
         Pkl_data, Pkl_var,
@@ -317,25 +323,34 @@ def build_settings_from_deck(deck):
 
 def save_fit_results(output_path, result, best_fit, deck_text=None,
                      time_axis=None, sampling_result=None,
-                     save_cross_corr=True):
+                     save_cross_corr=True, save_samples=True):
     """Save fit results to an HDF5 file.
 
     Datasets written:
     - ``/best_fit``         : (Nk, Nt) forward model at best-fit params
     - ``/params/<prefix>``  : (Nt,) array per parameter prefix
     - ``/time``             : (Nt,) time array (if provided)
-    - ``/summary/...``      : posterior summary (if ``sampling_result`` given)
 
-    Sampling-result schema under ``/summary/``:
-    - ``mean/<prefix>``, ``std/<prefix>``, ``p16/<prefix>``,
-      ``p50/<prefix>``, ``p84/<prefix>``           — (Nt,)
-    - ``correlations/<prefix>``                    — (Nt, Nt) intra-prefix
-    - ``rhat/<prefix>``, ``ess/<prefix>``          — (Nt,)
-    - ``cross_correlations``                       — (P·Nt, P·Nt), if requested
+    When ``sampling_result`` is provided, posterior outputs are written into
+    the same file:
+    - ``/summary/mean|std|p16|p50|p84/<prefix>``   — (Nt,)
+    - ``/summary/correlations/<prefix>``           — (Nt, Nt) intra-prefix
+    - ``/summary/rhat|ess/<prefix>``               — (Nt,)
+    - ``/summary/cross_correlations``              — (P·Nt, P·Nt), optional
+    - ``/samples/<prefix>``                        — (n_chains, n_samples, Nt)
+    - ``/u_samples``                               — (n_chains, n_samples, D)
+    - ``/log_probs``                               — (n_chains, n_samples)
+    - ``/step_size_history``                       — (burn_in,)
+    - ``/varying_keys``                            — (D,) string
+    - ``/u_chain_init``                            — (D,)
+
+    Set ``save_samples=False`` to keep only the ``/summary/`` group (much
+    smaller file; raw chains discarded). ``save_cross_corr=False`` further
+    drops the full cross-correlation matrix.
 
     File-level attributes:
     - ``loss``, ``success``, ``nit``
-    - ``deck_toml``         : raw deck text for provenance (if provided)
+    - ``deck_toml`` (if provided)
     """
     import h5py
 
@@ -357,11 +372,19 @@ def save_fit_results(output_path, result, best_fit, deck_text=None,
 
         if sampling_result is not None:
             _write_sampling_summary(fh, sampling_result,
-                                    save_cross_corr=save_cross_corr)
+                                    save_cross_corr=save_cross_corr,
+                                    save_samples=save_samples)
 
 
-def _write_sampling_summary(fh, samp, *, save_cross_corr=True):
-    """Write the ``/summary/...`` group into an open HDF5 file."""
+def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
+                            save_samples=True):
+    """Write posterior summary + (optionally) raw samples into ``fh``.
+
+    Writes the ``/summary/...`` group always. When ``save_samples`` is True,
+    additionally writes the full posterior chains under ``/samples/<prefix>``
+    plus ``/u_samples``, ``/log_probs``, ``/step_size_history``,
+    ``/varying_keys``, and ``/u_chain_init``.
+    """
     import h5py
     summary = fh.create_group("summary")
     for stat in ("mean", "std", "p16", "p50", "p84"):
@@ -412,24 +435,7 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True):
     summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
     summary.attrs["wall_time_s"]    = float(samp.wall_time)
 
-
-def save_posterior_samples(output_path, samp):
-    """Save the full posterior-sample sidecar HDF5 from a sampling result.
-
-    Layout:
-    - ``/samples/<prefix>``    : (n_chains, n_samples, Nt) constraint-resolved
-    - ``/u_samples``           : (n_chains, n_samples, D) raw u-space
-    - ``/log_probs``           : (n_chains, n_samples)
-    - ``/step_size_history``   : (burn_in,)
-    - ``/varying_keys``        : (D,) string
-    - ``/u_chain_init``        : (D,)
-    """
-    import h5py  # local import keeps the deck module light at import-time
-
-    output_path = _pathlib.Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with h5py.File(output_path, "w") as fh:
+    if save_samples:
         samples_grp = fh.create_group("samples")
         for prefix, arr in samp.samples_phys.items():
             samples_grp.create_dataset(prefix, data=_np.asarray(arr))
@@ -441,14 +447,3 @@ def save_posterior_samples(output_path, samp):
             "varying_keys",
             data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
         )
-        fh.attrs["n_chains"]       = int(samp.n_chains)
-        fh.attrs["n_samples"]      = int(samp.n_samples)
-        fh.attrs["burn_in"]        = int(samp.burn_in)
-        fh.attrs["thin"]           = int(samp.thin)
-        fh.attrs["temperature"]    = float(samp.temperature)
-        fh.attrs["step_size_final"] = float(samp.step_size_final)
-        fh.attrs["precond"]        = str(samp.precond)
-        fh.attrs["seed"]           = int(samp.seed)
-        fh.attrs["max_rhat"]       = float(samp.max_rhat)
-        fh.attrs["min_ess"]        = float(samp.min_ess)
-        fh.attrs["wall_time_s"]    = float(samp.wall_time)

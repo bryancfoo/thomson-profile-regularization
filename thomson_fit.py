@@ -18,9 +18,9 @@ a few extensions resolved here before the standard parser runs:
   [plotting]                      Save initial-guess, streak, and profile pngs.
 
 The ``--sample`` flag (or ``[sampling].enabled = true`` in the deck) triggers
-multi-chain preconditioned SGLD posterior sampling after the MAP fit; the
-posterior summary lands in the primary HDF5 under ``/summary/``, and an
-optional samples sidecar at ``<output>_samples.h5``.
+multi-chain preconditioned SGLD posterior sampling after the MAP fit. The
+posterior summary and (by default) the raw chains both land in the primary
+HDF5 — see ``DECK_API.md`` for the layout.
 
 The deck file's directory is the base for all relative paths it references.
 See ``DECK_API.md`` at the repo root for the full deck schema.
@@ -45,7 +45,6 @@ from ThomsonScattering.deck import (
     load_deck,
     build_settings_from_deck,
     save_fit_results,
-    save_posterior_samples,
 )
 from ThomsonScattering.fitting import run_fit_grad, compute_initial_fit, _build_grad_problem
 
@@ -255,7 +254,6 @@ def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
     # function signature except for the temperature sentinel.
     s = dict(sampling_settings)
     s.pop("enabled", None)
-    s.pop("samples_path", None)
     s.pop("save_samples", None)
     s.pop("save_cross_corr", None)
     # Temperature default sentinel: "auto" → None inside the sampler
@@ -400,17 +398,15 @@ def main(argv=None):
         )
 
     save_cross_corr = bool(sampling_settings.get("save_cross_corr", True))
+    save_samples    = bool(sampling_settings.get("save_samples", True))
     save_fit_results(
         out_path, result, best_fit_np,
         deck_text=deck_text, time_axis=time_axis,
-        sampling_result=sampling_result, save_cross_corr=save_cross_corr,
+        sampling_result=sampling_result,
+        save_cross_corr=save_cross_corr,
+        save_samples=save_samples,
     )
     print(f"Results saved to: {out_path}")
-
-    if sampling_result is not None and sampling_settings.get("save_samples", True):
-        samples_path = sampling_settings["samples_path"]
-        save_posterior_samples(samples_path, sampling_result)
-        print(f"Posterior samples saved to: {samples_path}")
 
     # Read the per-prefix profiles back for plotting and optional legacy layout.
     with h5py.File(out_path, "r") as hf:
