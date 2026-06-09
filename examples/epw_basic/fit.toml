@@ -78,3 +78,9 @@ tol       = 1e-10
 
 [output]
 path = "fit_result.h5"
+
+[plotting]
+shot_num     = 1
+streak_png   = "spectra.png"
+profiles_png = "params_vs_time.png"
+profile_vars = ["n", "Te0"]

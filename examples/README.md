@@ -1,6 +1,6 @@
 # Examples
 
-Five self-contained examples, each in its own subdirectory. They share the
+Six self-contained examples, each in its own subdirectory. They share the
 synthetic data files in [`data/`](data/).
 
 ## One-time setup
@@ -18,6 +18,7 @@ python examples/data/make_data_iaw.py     # → data_iaw.h5  +  throughput.csv
 | [`forward_only/`](forward_only/) | forward model from `[profiles]`, no fitting | `data_epw.h5` |
 | [`iaw_constraints/`](iaw_constraints/) | multi-ion IAW + `[constraints]` + `[[extra_params]]` (charge balance) | `data_iaw.h5` |
 | [`iaw_sample/`](iaw_sample/) | same as `iaw_constraints` plus SGLD posterior sampling | `data_iaw.h5` |
+| [`iaw_l_curve/`](iaw_l_curve/) | same as `iaw_constraints` plus `[penalty.*]` + `[l_curve]` Tikhonov sweep | `data_iaw.h5` |
 | [`iaw_full/`](iaw_full/) | "kitchen sink": IRF + throughput + notch + background + `[probe_beam]` + every `[penalty.*]` | `data_iaw.h5` |
 
 ## Running an example

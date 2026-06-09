@@ -40,9 +40,10 @@ _jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
-from jax import jit, value_and_grad, vmap, grad
+from jax import jit, value_and_grad, vmap, grad, pmap
 
 from .fitting import _log_det_jac_u
+from .parallel import serial_requested
 
 
 # ─── sampling-problem wrapper ───────────────────────────────────────────────
@@ -255,6 +256,28 @@ def _make_vmapped_step(target_grad_fn, kind):
     return jit(step)
 
 
+def _make_pmapped_step(target_grad_fn, kind, devices):
+    """Like :func:`_make_vmapped_step`, but maps the per-chain step across
+    ``devices`` (one chain per device) so the chains advance concurrently.
+
+    Numerically identical to the vmapped version: the per-chain keys are still
+    generated host-side and passed in, so only *where* each chain's step runs
+    changes (device placement does not change the math or the RNG). Requires
+    ``n_chains == len(devices)``; the caller slices ``jax.devices()[:n_chains]``.
+    Non-mapped args (``eps``, the preconditioner) are broadcast to every device.
+    """
+    if kind == "diag":
+        def step(u, key, eps, M_diag):
+            return _sgld_step_diag(u, key, eps, M_diag, target_grad_fn)
+        return pmap(step, in_axes=(0, 0, None, None), devices=devices)
+    elif kind == "full":
+        def step(u, key, eps, M_full, L_chol):
+            return _sgld_step_full(u, key, eps, M_full, L_chol, target_grad_fn)
+        return pmap(step, in_axes=(0, 0, None, None, None), devices=devices)
+    else:
+        raise ValueError(f"Unknown step kind: {kind!r}")
+
+
 def _drift_noise_ratio(g_arr, eps, M_diag_or_full, kind):
     """Median over (chains × coords) of |drift_i| / |noise_i| as adapt proxy.
 
@@ -451,8 +474,19 @@ def run_sgld_posterior(problem, u_map, *,
         raise ValueError(f"Unknown precond: {precond!r}. Choose "
                          "'diag_hessian', 'full_hessian', 'rmsprop', or 'identity'.")
 
-    # Build the vmapped step function.
-    step_fn = _make_vmapped_step(problem_s.target_log_prob_and_grad, kind)
+    # Build the per-chain step function. When the host exposes >1 device with at
+    # least one device per chain (and parallelism isn't disabled), map the chains
+    # across devices with pmap so they advance concurrently; otherwise vmap them
+    # on a single device. Numerically identical either way (the sampler's
+    # objective is built unsharded, so each chain runs a plain forward+grad).
+    n_dev = _jax.device_count()
+    use_chain_pmap = (not serial_requested()) and n_dev > 1 and n_chains <= n_dev
+    if use_chain_pmap:
+        chain_devices = _jax.devices()[:n_chains]
+        step_fn = _make_pmapped_step(
+            problem_s.target_log_prob_and_grad, kind, chain_devices)
+    else:
+        step_fn = _make_vmapped_step(problem_s.target_log_prob_and_grad, kind)
 
     # Initialize chain states: perturb in sigma_u units (sqrt of diag precond)
     # so perturb_scale=1.0 means "start chains roughly 1 posterior std apart

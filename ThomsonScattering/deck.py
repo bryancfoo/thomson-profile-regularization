@@ -118,6 +118,11 @@ def build_settings_from_deck(deck):
     sampling_settings   : dict
         From the deck's ``[sampling]`` section. Always present;
         ``enabled = False`` when the section is missing.
+    l_curve_settings    : dict
+        From the deck's ``[l_curve]`` section. Always present;
+        ``enabled = False`` when the section is missing. When enabled, the
+        ``lambda_scale`` field is resolved to a 1-D numpy array (either from
+        a literal list or expanded from ``lambda_scale_log``).
     """
     base_dir = deck.get("_base_dir", _pathlib.Path("."))
 
@@ -308,6 +313,38 @@ def build_settings_from_deck(deck):
     sampling_settings = dict(samp_raw) if samp_raw is not None else {}
     sampling_settings.setdefault("enabled", False)
 
+    # ── [l_curve] section ──────────────────────────────────────────────────
+    # Optional L-curve sweep — replaces the single MAP fit when enabled.
+    # ``lambda_scale`` is either an explicit list or, if absent, expanded
+    # from ``lambda_scale_log = {min = -3, max = 2, n = 21}``.
+    lc_raw = deck.get("l_curve", None)
+    l_curve_settings = dict(lc_raw) if lc_raw is not None else {}
+    l_curve_settings.setdefault("enabled", False)
+    # Resolve lambda_scale whenever it's specified — independent of `enabled` —
+    # so the `--l-curve` CLI flag works even when the deck didn't set
+    # enabled = true. Only error about a missing lambda_scale when the section is
+    # actually switched on (so a disabled/empty [l_curve] stays harmless).
+    if "lambda_scale" in l_curve_settings:
+        l_curve_settings["lambda_scale"] = _np.asarray(
+            l_curve_settings["lambda_scale"], dtype=float,
+        )
+    elif "lambda_scale_log" in l_curve_settings:
+        spec = l_curve_settings.pop("lambda_scale_log")
+        try:
+            lo = float(spec["min"]); hi = float(spec["max"])
+            n  = int(spec["n"])
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                "[l_curve].lambda_scale_log must be a table with keys "
+                "{min, max, n}, e.g. {min = -3, max = 2, n = 21}."
+            ) from exc
+        l_curve_settings["lambda_scale"] = _np.logspace(lo, hi, n)
+    elif l_curve_settings.get("enabled"):
+        raise ValueError(
+            "[l_curve] requires either 'lambda_scale' (list) or "
+            "'lambda_scale_log' ({min, max, n})."
+        )
+
     return (
         Pkl_data, Pkl_var,
         measurement_settings,
@@ -318,18 +355,34 @@ def build_settings_from_deck(deck):
         constraints_settings,
         output_path,
         sampling_settings,
+        l_curve_settings,
     )
 
 
 def save_fit_results(output_path, result, best_fit, deck_text=None,
                      time_axis=None, sampling_result=None,
-                     save_cross_corr=True, save_samples=True):
+                     save_cross_corr=True, save_samples=True,
+                     l_curve_result=None):
     """Save fit results to an HDF5 file.
 
     Datasets written:
     - ``/best_fit``         : (Nk, Nt) forward model at best-fit params
     - ``/params/<prefix>``  : (Nt,) array per parameter prefix
     - ``/time``             : (Nt,) time array (if provided)
+
+    When ``l_curve_result`` is provided (from
+    :func:`ThomsonScattering.l_curve.compute_L_curve`), a ``/l_curve`` group
+    is added with the full sweep:
+    - ``/l_curve/lambda_scale``       — (N,)
+    - ``/l_curve/residual_norm``      — (N,)
+    - ``/l_curve/penalty_norm``       — (N,)
+    - ``/l_curve/curvature``          — (N,)
+    - ``/l_curve/loss``               — (N,)
+    - ``/l_curve/best_fits``          — (N, Nk, Nt)
+    - ``/l_curve/params/<prefix>``    — (N, Nt)
+    - ``/l_curve/unreg/best_fit``     — (Nk, Nt)   when warm-started
+    - ``/l_curve/unreg/params/<prefix>`` — (Nt,)   when warm-started
+    plus attrs ``optimal_index``, ``optimal_lambda_scale``, ``warm_start``.
 
     When ``sampling_result`` is provided, posterior outputs are written into
     the same file:
@@ -374,6 +427,36 @@ def save_fit_results(output_path, result, best_fit, deck_text=None,
             _write_sampling_summary(fh, sampling_result,
                                     save_cross_corr=save_cross_corr,
                                     save_samples=save_samples)
+
+        if l_curve_result is not None:
+            _write_l_curve(fh, l_curve_result)
+
+
+def _write_l_curve(fh, lc):
+    """Write the ``/l_curve`` group from a `compute_L_curve` result."""
+    g = fh.create_group("l_curve")
+    g.create_dataset("lambda_scale",  data=_np.asarray(lc.lambda_scale))
+    g.create_dataset("residual_norm", data=_np.asarray(lc.residual_norm))
+    g.create_dataset("penalty_norm",  data=_np.asarray(lc.penalty_norm))
+    g.create_dataset("curvature",     data=_np.asarray(lc.curvature))
+    g.create_dataset("loss",          data=_np.asarray(lc.loss))
+    g.create_dataset("best_fits",     data=_np.asarray(lc.best_fits))
+    params_g = g.create_group("params")
+    for prefix, arr in lc.params.items():
+        params_g.create_dataset(prefix, data=_np.asarray(arr))
+    g.attrs["optimal_index"]        = int(lc.optimal_index)
+    g.attrs["optimal_lambda_scale"] = float(lc.lambda_scale[lc.optimal_index])
+    g.attrs["warm_start"]           = lc.unreg_result is not None
+
+    if lc.unreg_result is not None:
+        u = g.create_group("unreg")
+        u.create_dataset("best_fit", data=_np.asarray(lc.unreg_best_fit))
+        up = u.create_group("params")
+        for prefix, arr in lc.unreg_result.params_dict.items():
+            up.create_dataset(prefix, data=_np.asarray(arr))
+        u.attrs["loss"]    = float(lc.unreg_result.fun)
+        u.attrs["nit"]     = int(lc.unreg_result.nit)
+        u.attrs["success"] = bool(lc.unreg_result.success)
 
 
 def _write_sampling_summary(fh, samp, *, save_cross_corr=True,

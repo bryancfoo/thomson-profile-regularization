@@ -27,8 +27,49 @@ See ``DECK_API.md`` at the repo root for the full deck schema.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+
+def _bootstrap_cpu_devices():
+    """Resolve --n-devices (or THOMSON_CPU_DEVICES) into the XLA device-count
+    flag *before* JAX is imported below. Used for intra-fit time-axis sharding
+    of a single streak fit. (For L-curve sweeps use --n-workers instead; don't
+    combine the two — they would oversubscribe the cores.)
+    """
+    # Global kill-switch: --serial (or THOMSON_NO_PARALLEL) disables both the
+    # process pool and device sharding. Honor it here, before JAX initializes,
+    # so no extra devices are created.
+    serial = "--serial" in sys.argv or os.environ.get(
+        "THOMSON_NO_PARALLEL", "").strip().lower() not in ("", "0", "false", "no")
+    if serial:
+        os.environ["THOMSON_NO_PARALLEL"] = "1"
+        return
+
+    n = os.environ.get("THOMSON_CPU_DEVICES")
+    argv = sys.argv
+    for i, a in enumerate(argv):
+        if a == "--n-devices" and i + 1 < len(argv):
+            n = argv[i + 1]
+        elif a.startswith("--n-devices="):
+            n = a.split("=", 1)[1]
+    if not n:
+        return
+    os.environ["THOMSON_CPU_DEVICES"] = str(n)
+    try:
+        ni = int(n)
+    except (TypeError, ValueError):
+        return
+    if ni <= 1:
+        return
+    flag = "--xla_force_host_platform_device_count"
+    cur = os.environ.get("XLA_FLAGS", "")
+    if flag not in cur:
+        os.environ["XLA_FLAGS"] = (cur + f" {flag}={ni}").strip()
+
+
+_bootstrap_cpu_devices()
 
 # Force float64 BEFORE any other code touches jax.numpy. Some downstream
 # operations (e.g. Hessian-preconditioned sampling) need the extra precision.
@@ -232,6 +273,122 @@ def _plot_profiles_epw(profiles, time_axis, png_path, shot_num):
     plt.close(fig)
 
 
+_YLABEL_MAP = {
+    "n":      r"$n_e$ [cm$^{-3}$]",
+    "Te":     r"$T_e$ [eV]",
+    "Ti":     r"$T_i$ [eV]",
+    "ue":     r"$u_e$ [m/s]",
+    "ui":     r"$u_i$ [m/s]",
+    "pe":     r"$p_e$",
+    "pi":     r"$p_i$",
+    "efract": "efract",
+    "ifract": "ifract",
+    "bg":     "background coef",
+}
+
+
+def _ylabel_for_key(key):
+    base = key.rstrip("0123456789")
+    return _YLABEL_MAP.get(base, key)
+
+
+def _plot_profiles_generic(profiles, time_axis, png_path, shot_num, profile_vars):
+    """Plot an arbitrary list of profile keys, auto-laid-out up to 4 per row."""
+    import math as _math
+    n_vars = len(profile_vars)
+    if n_vars == 0:
+        return
+    ncols = min(3, n_vars)
+    nrows = _math.ceil(n_vars / ncols)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols,
+                             figsize=(4.5 * ncols, 3.5 * nrows), squeeze=False)
+    for idx, key in enumerate(profile_vars):
+        ax = axes[idx // ncols][idx % ncols]
+        if key in profiles:
+            ax.plot(time_axis, profiles[key])
+        else:
+            ax.text(0.5, 0.5, f"'{key}' not in results",
+                    ha="center", va="center", transform=ax.transAxes, color="gray")
+        ax.set_xlabel("Time [ns]")
+        ax.set_ylabel(_ylabel_for_key(key))
+        ax.set_title(key)
+    for idx in range(n_vars, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+    fig.suptitle(f"Shot {shot_num} fitted profiles")
+    fig.tight_layout()
+    Path(png_path).parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving {png_path}...")
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ─── L-curve phase ─────────────────────────────────────────────────────────────
+
+def _run_l_curve_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
+                       fit_kw, l_curve_settings):
+    """Run a Tikhonov L-curve sweep. Returns ``(result, best_fit, lc)`` where
+    ``result``/``best_fit`` correspond to the max-curvature ("optimal") λ.
+    """
+    from ThomsonScattering.l_curve import compute_L_curve
+
+    if not pen:
+        raise ValueError(
+            "[l_curve] requires at least one [penalty.<prefix>] section in the "
+            "deck — the sweep multiplies those base lambda_weights by lambda_scale."
+        )
+
+    lambda_scale = l_curve_settings.get("lambda_scale")
+    if lambda_scale is None:
+        raise ValueError(
+            "[l_curve] lambda_scale not resolved by the deck parser — "
+            "this is a bug in build_settings_from_deck."
+        )
+    warm_start = bool(l_curve_settings.get("warm_start", True))
+    n_workers = l_curve_settings.get("n_workers")
+
+    print(f"\nRunning L-curve sweep over {len(lambda_scale)} lambda_scale "
+          f"values (warm_start={warm_start})...")
+    lc = compute_L_curve(
+        Pkl_data, Pkl_var, meas,
+        penalty_settings=pen,
+        lambda_scale=lambda_scale,
+        params_settings=pars,
+        constraints=constraints,
+        extra_params=extras,
+        fit_settings=fit_kw,
+        warm_start=warm_start,
+        progress=True,
+        n_workers=n_workers,
+    )
+    return lc.optimal_result, lc.optimal_best_fit, lc
+
+
+def _plot_l_curve(lc, png_path, shot_num):
+    """Log-log plot of penalty_norm vs. residual_norm with the corner marked."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.loglog(lc.residual_norm, lc.penalty_norm, "o-", color="C0",
+              label="L-curve")
+    i = int(lc.optimal_index)
+    ax.loglog(lc.residual_norm[i], lc.penalty_norm[i], "o", color="C3",
+              markersize=12, fillstyle="none", markeredgewidth=2,
+              label=f"corner (λ_scale={lc.lambda_scale[i]:.3g})")
+    for j, s in enumerate(lc.lambda_scale):
+        ax.annotate(f"{s:.2g}",
+                    (lc.residual_norm[j], lc.penalty_norm[j]),
+                    fontsize=7, xytext=(4, 4), textcoords="offset points",
+                    color="gray")
+    ax.set_xlabel("Residual norm  (data chi² / N_pix)")
+    ax.set_ylabel("Penalty norm  R(x)  (base λ weighting)")
+    ax.set_title(f"Shot {shot_num} — Tikhonov L-curve")
+    ax.legend()
+    ax.grid(True, which="both", ls=":", alpha=0.5)
+    fig.tight_layout()
+    Path(png_path).parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving {png_path}...")
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ─── sampling phase ────────────────────────────────────────────────────────────
 
 def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
@@ -239,10 +396,14 @@ def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
     """Run multi-chain SGLD given a finished MAP fit. Returns sampling result."""
     from ThomsonScattering.sampling import run_sgld_posterior
 
+    # shard_time=False: the per-chain vmap in the sampler does not compose with
+    # the shard_map inside the objective, so the sampler always uses the
+    # unsharded objective (it parallelizes over chains instead).
     problem = _build_grad_problem(
         Pkl_data, Pkl_var, meas,
         penalty_settings=pen, params_settings=pars,
         constraints=constraints, extra_params=extras,
+        shard_time=False,
     )
     x_phys = np.asarray(map_result.x)
     u_map = np.array([
@@ -303,6 +464,29 @@ def _parse_args(argv):
                         help="Run multi-chain SGLD posterior sampling after "
                              "the MAP fit. Overrides [sampling].enabled in "
                              "the deck if set.")
+    parser.add_argument("--l-curve", dest="l_curve", action="store_true",
+                        help="Run a Tikhonov L-curve sweep instead of a "
+                             "single MAP fit. Requires an [l_curve] section "
+                             "in the deck (for lambda_scale). The optimal-"
+                             "lambda fit becomes the saved best fit.")
+    parser.add_argument("--n-workers", dest="n_workers", type=int, default=None,
+                        help="Number of parallel worker PROCESSES for the L-curve "
+                             "sweep (independent fits run at once; each uses ~3-4 "
+                             "cores — this is not a core count). Default 1 "
+                             "(sequential). N>1 runs N fits at a time; 0 or "
+                             "negative auto-sizes to cores//4. Overrides "
+                             "[l_curve].n_workers in the deck.")
+    parser.add_argument("--n-devices", dest="n_devices", type=int, default=None,
+                        help="Expose the host CPU as N XLA devices and shard a "
+                             "single fit's forward+grad over the time axis across "
+                             "them (intra-fit parallelism). Read before JAX init "
+                             "(see _bootstrap_cpu_devices). Use for one big streak "
+                             "fit; do NOT combine with --n-workers > 1.")
+    parser.add_argument("--serial", action="store_true",
+                        help="Kill-switch: disable ALL parallelism (process pool "
+                             "and device sharding) regardless of other flags or "
+                             "deck settings. Equivalent to THOMSON_NO_PARALLEL=1. "
+                             "Use on small/shared machines to keep core usage low.")
     return parser.parse_args(argv)
 
 
@@ -352,6 +536,7 @@ def main(argv=None):
         meas, pen, pars, fit_kw,
         extras, constraints, out_path,
         sampling_settings,
+        l_curve_settings,
     ) = build_settings_from_deck(deck)
 
     print(f"\nRunning fit  Nt={Pkl_data.shape[1]}  Nk={Pkl_data.shape[0]}")
@@ -375,23 +560,48 @@ def main(argv=None):
                             lam_nm, time_axis, base_dir / init_png, shot_num)
         print(f"Wrote {init_png}")
 
-    result, best_fit = run_fit_grad(
-        Pkl_data, Pkl_var, meas,
-        penalty_settings=pen,
-        params_settings=pars,
-        fit_settings=fit_kw,
-        extra_params=extras,
-        constraints=constraints,
-        progress=True,
-    )
-    print(f"\nloss={result.fun:.6g}  nit={result.nit}  success={result.success}")
+    if args.serial:
+        os.environ["THOMSON_NO_PARALLEL"] = "1"
+    if args.n_workers is not None:
+        l_curve_settings["n_workers"] = args.n_workers
+
+    do_l_curve = args.l_curve or bool(l_curve_settings.get("enabled", False))
+    l_curve_result = None
+    if do_l_curve:
+        result, best_fit, l_curve_result = _run_l_curve_phase(
+            Pkl_data, Pkl_var, meas, pen, pars, extras, constraints, fit_kw,
+            l_curve_settings,
+        )
+        opt_i  = l_curve_result.optimal_index
+        opt_ls = float(l_curve_result.lambda_scale[opt_i])
+        print(f"\nL-curve: optimal index={opt_i}  lambda_scale={opt_ls:.4g}  "
+              f"residual={l_curve_result.residual_norm[opt_i]:.4g}  "
+              f"penalty={l_curve_result.penalty_norm[opt_i]:.4g}")
+        print(f"loss={result.fun:.6g}  nit={result.nit}  success={result.success}")
+    else:
+        result, best_fit = run_fit_grad(
+            Pkl_data, Pkl_var, meas,
+            penalty_settings=pen,
+            params_settings=pars,
+            fit_settings=fit_kw,
+            extra_params=extras,
+            constraints=constraints,
+            progress=True,
+        )
+        print(f"\nloss={result.fun:.6g}  nit={result.nit}  success={result.success}")
 
     best_fit_np = np.asarray(best_fit)
 
     # ── Optional: posterior sampling ───────────────────────────────────────
     sampling_result = None
     do_sample = args.sample or bool(sampling_settings.get("enabled", False))
-    if do_sample:
+    if do_sample and do_l_curve:
+        print("\nWARNING: both [l_curve] and [sampling] are enabled. "
+              "Sampling around a single MAP point is ill-defined when the "
+              "regularization strength is itself being swept; skipping the "
+              "sampling phase. Re-run without --l-curve (or set "
+              "[l_curve].enabled = false) to sample at the deck's base lambda.")
+    elif do_sample:
         sampling_result = _run_sampling_phase(
             Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
             result, sampling_settings,
@@ -405,8 +615,15 @@ def main(argv=None):
         sampling_result=sampling_result,
         save_cross_corr=save_cross_corr,
         save_samples=save_samples,
+        l_curve_result=l_curve_result,
     )
     print(f"Results saved to: {out_path}")
+
+    if l_curve_result is not None:
+        l_curve_png = l_curve_settings.get("plot_path")
+        if l_curve_png:
+            _plot_l_curve(l_curve_result, base_dir / l_curve_png, shot_num)
+            print(f"Wrote {l_curve_png}")
 
     # Read the per-prefix profiles back for plotting and optional legacy layout.
     with h5py.File(out_path, "r") as hf:
@@ -419,17 +636,23 @@ def main(argv=None):
         print(f"Wrote {streak_png}")
 
     profiles_png = plot_cfg.get("profiles_png")
-    layout = plot_cfg.get("profile_layout", "epw")
+    profile_vars = plot_cfg.get("profile_vars")
     if profiles_png:
-        if layout == "epw":
-            plot_profiles = {k: profiles[k] for k in ("n", "Te", "pe") if k in profiles}
-            _plot_profiles_epw(plot_profiles, time_axis, base_dir / profiles_png, shot_num)
-            print(f"Wrote {profiles_png}")
-        elif layout == "iaw":
-            _plot_profiles_iaw(profiles, time_axis, base_dir / profiles_png, shot_num)
+        if profile_vars is not None:
+            _plot_profiles_generic(profiles, time_axis, base_dir / profiles_png,
+                                   shot_num, profile_vars)
             print(f"Wrote {profiles_png}")
         else:
-            print(f"Skipping profiles plot: layout={layout!r} not implemented.")
+            layout = plot_cfg.get("profile_layout", "epw")
+            if layout == "epw":
+                plot_profiles = {k: profiles[k] for k in ("n", "Te", "pe") if k in profiles}
+                _plot_profiles_epw(plot_profiles, time_axis, base_dir / profiles_png, shot_num)
+                print(f"Wrote {profiles_png}")
+            elif layout == "iaw":
+                _plot_profiles_iaw(profiles, time_axis, base_dir / profiles_png, shot_num)
+                print(f"Wrote {profiles_png}")
+            else:
+                print(f"Skipping profiles plot: layout={layout!r} not implemented.")
 
 
 if __name__ == "__main__":

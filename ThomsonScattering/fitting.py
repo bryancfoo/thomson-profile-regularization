@@ -269,6 +269,117 @@ def _log_likelihood(fit, data, variance):
     return jnp.sum(r) / jnp.sum(~mask)
 
 
+# ─── time-axis sharding (intra-fit CPU parallelism) ──────────────────────────
+
+def _pad_time_axis(moments, pad):
+    """Pad each moment array's time axis (the last axis) by ``pad``, edge mode.
+
+    ``None`` entries (e.g. absent background) pass through. Edge padding repeats
+    the last real time column so the forward model stays finite on the padded
+    columns; those columns carry NaN data and are masked out of the loss, and
+    ``jnp.pad``'s VJP discards their gradients, so the real columns are
+    unaffected.
+    """
+    if pad == 0:
+        return tuple(moments)
+    out = []
+    for a in moments:
+        if a is None:
+            out.append(None)
+        elif jnp.ndim(a) == 1:
+            out.append(jnp.pad(a, (0, pad), mode="edge"))
+        else:
+            out.append(jnp.pad(a, ((0, 0), (0, pad)), mode="edge"))
+    return tuple(out)
+
+
+def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg):
+    """Time-sharded data-fidelity term, fp-identical to
+    ``_log_likelihood(_call_forward(...), Pkl_data, Pkl_var)``.
+
+    The forward model is independent per time slice (the only cross-time
+    coupling, the Tikhonov penalty, lives outside this term), so the Nt axis is
+    sharded across ``n_dev`` CPU devices via ``shard_map``. Each device runs the
+    full forward (all angles/wavelengths) for its block of time slices; only the
+    masked chi^2 sum and the valid-pixel count are reduced across shards
+    (``psum``). The Nt axis is padded up to a multiple of ``n_dev`` with NaN data
+    columns, which mask out and contribute nothing — so the result matches the
+    unsharded loss up to float64 summation order.
+
+    The per-time instrument-response array ``instr_func_arr`` (Nk, Nt) must be
+    sharded along time too — otherwise the forward's per-time IRF conv vmap sees
+    a full-Nt IRF against an Nt-block spectrum and errors. We pad+shard it and
+    substitute the per-shard slice into a per-shard copy of measurement_settings.
+    """
+    from jax.sharding import Mesh, PartitionSpec as P
+    try:
+        # The (mesh=, in_specs=, out_specs=) signature validated in the spike.
+        from jax.experimental.shard_map import shard_map as _shard_map
+    except ImportError:                                  # removed in a future jax
+        _shard_map = _jax.shard_map
+
+    mesh = Mesh(np.asarray(_jax.devices()[:n_dev]), ("t",))
+    Nt_pad = -(-int(Nt) // n_dev) * n_dev                 # ceil to multiple of n_dev
+    pad = Nt_pad - int(Nt)
+    data_p = jnp.pad(jnp.asarray(Pkl_data), ((0, 0), (0, pad)), constant_values=jnp.nan)
+    var_p  = jnp.pad(jnp.asarray(Pkl_var),  ((0, 0), (0, pad)), constant_values=jnp.nan)
+
+    # Per-time IRF (Nk, Nt): pad+shard along time. If absent (or not 2-D), pass a
+    # tiny dummy that the forward ignores.
+    _irf = measurement_settings.get("instr_func_arr", None)
+    has_time_irf = _irf is not None and jnp.ndim(jnp.asarray(_irf)) == 2
+    if has_time_irf:
+        irf_p = jnp.pad(jnp.asarray(_irf), ((0, 0), (0, pad)), mode="edge")
+    else:
+        irf_p = jnp.zeros((1, Nt_pad), dtype=jnp.float64)
+
+    PT, PST = P("t"), P(None, "t")          # (Nt,) and (·, Nt) arrays
+    moment_specs = (PT,) + (PST,) * 8        # n + 8 (species, Nt) moment arrays
+
+    def _fwd(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local):
+        ms = ({**measurement_settings, "instr_func_arr": irf_local}
+              if has_time_irf else measurement_settings)
+        return _call_forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, ms)
+
+    def _core(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local, data, var):
+        fit = _fwd(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local)
+        mask   = jnp.isnan(data) | jnp.isnan(fit)
+        fit_s  = jnp.where(mask, 0.0, fit)
+        data_s = jnp.where(mask, 0.0, data)
+        var_s  = jnp.where(mask, 1.0, var)
+        r = (fit_s - data_s) ** 2 / var_s
+        sse = jnp.sum(r)
+        cnt = jnp.sum((~mask).astype(r.dtype))
+        return _jax.lax.psum(sse, "t"), _jax.lax.psum(cnt, "t")
+
+    if has_bg:
+        mapped = _shard_map(_core, mesh=mesh,
+                            in_specs=moment_specs + (PST, PST, PST, PST),  # bg, irf, data, var
+                            out_specs=(P(), P()))
+
+        def sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
+            m = _pad_time_axis(
+                (n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg), pad)
+            sse, cnt = mapped(*m, irf_p, data_p, var_p)
+            return sse / cnt
+    else:
+        def _core_nobg(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, irf_local, data, var):
+            return _core(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, None,
+                         irf_local, data, var)
+
+        mapped = _shard_map(_core_nobg, mesh=mesh,
+                            in_specs=moment_specs + (PST, PST, PST),  # irf, data, var
+                            out_specs=(P(), P()))
+
+        def sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
+            m = _pad_time_axis(
+                (n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract), pad)
+            sse, cnt = mapped(*m, irf_p, data_p, var_p)
+            return sse / cnt
+
+    return sharded_nll
+
+
 # ─── grad-problem assembly ──────────────────────────────────────────────────
 
 def _build_penalty_list(penalty_settings, Nelectrons, Nions, background_order):
@@ -372,11 +483,17 @@ def _log_det_jac_u(u, lower, upper, *, floor=1e-30):
 
 def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
                         penalty_settings=None, params_settings=None,
-                        constraints=None, extra_params=None):
+                        constraints=None, extra_params=None, shard_time=None):
     """Set up the differentiable Thomson-fit problem in unconstrained space.
 
     Returns a SimpleNamespace bundling every closure and metadatum that
     ``run_fit_grad`` (and future posterior samplers) need.
+
+    ``shard_time`` controls intra-fit time-axis sharding of the data-fidelity
+    forward+grad: ``None`` (default) shards when the host exposes >1 XLA device,
+    ``False`` forces it off, ``True`` forces it on when possible. Samplers pass
+    ``False`` because the per-chain ``vmap`` does not compose cleanly with the
+    ``shard_map`` inside the objective.
     """
     Nelectrons = measurement_settings["Nelectrons"]
     Nions = len(measurement_settings["ion_z"])
@@ -426,6 +543,42 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
             return x[key_to_idx[key]]
         return jnp.array(fixed_vals[key])
 
+    # Precompute per-prefix gather tables so _unpack / _build_params_dict can
+    # assemble (Nt,) arrays in a single XLA gather + where instead of a Python
+    # loop of Nt scalar indices. With Nt~651 the original loop made the JAX
+    # trace huge, which dominated jit compile time (especially for sgld_lbfgs
+    # which jits two separate step functions).
+    def _make_gather_table(prefix):
+        idx = np.zeros(Nt, dtype=np.int32)
+        fxd = np.zeros(Nt, dtype=np.float64)
+        free = np.zeros(Nt, dtype=bool)
+        for t in range(Nt):
+            key = f"{prefix}_{t}"
+            if key in key_to_idx:
+                idx[t] = key_to_idx[key]
+                free[t] = True
+            else:
+                fxd[t] = fixed_vals[key]
+        return jnp.asarray(idx), jnp.asarray(fxd), jnp.asarray(free)
+
+    _all_prefixes = list(_extra_prefixes) + ["n"]
+    for _s in range(Nelectrons):
+        _all_prefixes.extend([f"Te{_s}", f"ue{_s}", f"pe{_s}", f"efract{_s}"])
+    for _s in range(Nions):
+        _all_prefixes.extend([f"Ti{_s}", f"ui{_s}", f"pi{_s}", f"ifract{_s}"])
+    if background_order is not None:
+        for _i in range(background_order + 1):
+            _all_prefixes.append(f"bg{_i}")
+    gather_tables = {
+        pfx: _make_gather_table(pfx)
+        for pfx in _all_prefixes
+        if pfx not in _constraints
+    }
+
+    def _gather_prefix(x, prefix):
+        idx_arr, fixed_arr, is_free = gather_tables[prefix]
+        return jnp.where(is_free, x[idx_arr], fixed_arr)
+
     def _unpack(x):
         # p accumulates {prefix: (Nt,) array} so constraints can reference
         # previously assembled prefixes by name.
@@ -433,16 +586,14 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
 
         # Extras first: constraints may reference them by their bare name.
         for extra_prefix in _extra_prefixes:
-            p[extra_prefix] = jnp.stack(
-                [_get(x, f"{extra_prefix}_{t}") for t in range(Nt)]
-            )
+            p[extra_prefix] = _gather_prefix(x, extra_prefix)
 
         def _row(base, s):
             prefix = base if base == "n" else f"{base}{s}"
             if prefix in _constraints:
                 arr = _constraints[prefix](p)
             else:
-                arr = jnp.stack([_get(x, f"{prefix}_{t}") for t in range(Nt)])
+                arr = _gather_prefix(x, prefix)
             p[prefix] = arr
             return arr
 
@@ -463,14 +614,14 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
         """{prefix: (Nt,) array} for every parameter (free, fixed, constrained, extra)."""
         p = {}
         for ep in _extra_prefixes:
-            p[ep] = jnp.stack([_get(x, f"{ep}_{t}") for t in range(Nt)])
+            p[ep] = _gather_prefix(x, ep)
 
         def _fill(base, s):
             prefix = base if base == "n" else f"{base}{s}"
             if prefix in _constraints:
                 arr = _constraints[prefix](p)
             else:
-                arr = jnp.stack([_get(x, f"{prefix}_{t}") for t in range(Nt)])
+                arr = _gather_prefix(x, prefix)
             p[prefix] = arr
 
         _fill("n", None)
@@ -489,12 +640,28 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
         return _call_forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg,
                              measurement_settings)
 
+    # Intra-fit parallelism: when the host is exposed as multiple XLA devices
+    # (THOMSON_CPU_DEVICES / --n-devices), shard the data-fidelity forward+grad
+    # over the time axis. Numerically identical to the unsharded loss up to
+    # float64 summation order; the Tikhonov penalty below stays unsharded.
+    n_devices = _jax.device_count()
+    want_shard = (n_devices > 1) if shard_time is None else bool(shard_time)
+    use_time_shard = want_shard and n_devices > 1 and int(Nt) >= n_devices
+    sharded_nll = (
+        _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, int(Nt),
+                          n_devices, has_bg=(background_order is not None))
+        if use_time_shard else None
+    )
+
     # objective_flat must NOT be jit-decorated: jit(value_and_grad(f)) works,
     # but value_and_grad(jit(f)) cannot differentiate through the jit boundary.
     def objective_flat(x):
         n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg = _unpack(x)
-        fit = _forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg)
-        loss = _log_likelihood(fit, Pkl_data, Pkl_var)
+        if use_time_shard:
+            loss = sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg)
+        else:
+            fit = _forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg)
+            loss = _log_likelihood(fit, Pkl_data, Pkl_var)
         arr_map = {
             "n": n, "Te": Te, "ue": ue, "pe": pe, "efract": efract,
             "Ti": Ti, "ui": ui, "pi": pi_arr, "ifract": ifract,

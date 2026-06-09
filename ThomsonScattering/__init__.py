@@ -1,3 +1,34 @@
+# Expose the host CPU as N XLA devices for intra-fit time-axis sharding, when
+# requested via the THOMSON_CPU_DEVICES env var. This MUST happen before the
+# first `import jax` (XLA reads the device-count flag at initialization), which
+# is why it lives here at the top of the package __init__. The CLI sets the env
+# var from --n-devices before importing this package; library/notebook users
+# can export it themselves.
+import os as _os
+
+
+def _apply_cpu_device_count():
+    # Global kill-switch: THOMSON_NO_PARALLEL forces single-device (no sharding).
+    if _os.environ.get("THOMSON_NO_PARALLEL", "").strip().lower() not in (
+            "", "0", "false", "no"):
+        return
+    n = _os.environ.get("THOMSON_CPU_DEVICES")
+    if not n:
+        return
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return
+    if n <= 1:
+        return
+    flag = "--xla_force_host_platform_device_count"
+    cur = _os.environ.get("XLA_FLAGS", "")
+    if flag not in cur:
+        _os.environ["XLA_FLAGS"] = (cur + f" {flag}={n}").strip()
+
+
+_apply_cpu_device_count()
+
 # Enable double-precision JAX before any submodule (forward.py, fitting.py)
 # imports jax.numpy.  The whole codebase assumes float64: parameter ranges
 # span ~1e30 (densities), Tikhonov Hessians can be wildly ill-conditioned,
@@ -13,10 +44,12 @@ from .deck import (
 from .fitting import run_fit_grad, build_params, compute_initial_fit, Param
 from .forward import scattered_power_wavelength, spectral_density
 from .sampling import build_sampling_problem, run_sgld_posterior
+from .l_curve import compute_L_curve
 
 __all__ = [
     "load_deck", "build_settings_from_deck", "save_fit_results",
     "run_fit_grad", "build_params", "compute_initial_fit", "Param",
     "scattered_power_wavelength", "spectral_density",
     "build_sampling_problem", "run_sgld_posterior",
+    "compute_L_curve",
 ]

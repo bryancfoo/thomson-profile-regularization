@@ -29,6 +29,10 @@ Both also accept being called via `python thomson_fit.py ...` /
 `python thomson_forward.py ...`, and both fall back to an interactive
 prompt when no argument is provided.
 
+`thomson-fit` also takes optional flags:
+- `--sample`   — run posterior sampling after the MAP fit (also via `[sampling].enabled`).
+- `--l-curve`  — run a Tikhonov L-curve sweep instead of a single MAP fit (also via `[l_curve].enabled`).
+
 Examples live under [`examples/`](examples/), one subdirectory per deck:
 
 | Directory | Demonstrates |
@@ -37,6 +41,7 @@ Examples live under [`examples/`](examples/), one subdirectory per deck:
 | [`examples/forward_only/`](examples/forward_only/) | forward model from `[profiles]`, no fitting |
 | [`examples/iaw_constraints/`](examples/iaw_constraints/) | multi-ion IAW + `[constraints]` + `[[extra_params]]` + SGLD→LBFGS |
 | [`examples/iaw_sample/`](examples/iaw_sample/) | same as `iaw_constraints` plus posterior sampling |
+| [`examples/iaw_l_curve/`](examples/iaw_l_curve/) | same as `iaw_constraints` plus `[penalty.*]` + `[l_curve]` Tikhonov sweep |
 | [`examples/iaw_full/`](examples/iaw_full/) | "kitchen sink": IRF + throughput + `notch` + `background_order` + `[probe_beam]` + `[penalty.*]` + Adam |
 
 Generate the shared synthetic data, then run any example:
@@ -344,6 +349,58 @@ group and drop the raw chains (much smaller file). All samples are
 constraint-resolved, so `samples/ifract1` is the physical quantity
 `max(floor, 1 - ifract0)`, not the raw dummy.
 
+### `[l_curve]` — Tikhonov L-curve sweep (optional)
+
+Replaces the single MAP fit with a sweep over a global multiplier of the
+`[penalty.*]` `lambda_weights`. The *shape* of the regularizer (relative
+weights between prefixes and orders, plus `norm_scale` / `relative` /
+`thresholds` / `monotonic` / `profile_axis`) is held fixed; only the scalar
+moves. Triggered by `enabled = true` here or by the `--l-curve` CLI flag.
+
+```toml
+[l_curve]
+enabled      = true
+lambda_scale = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
+# Or, equivalently, a log-spaced shorthand (used when lambda_scale is absent):
+# lambda_scale_log = { min = -3, max = 2, n = 21 }   # → np.logspace(-3, 2, 21)
+warm_start   = true          # run an unregularized fit first, warm-start every λ
+plot_path    = "l_curve.png" # optional; relative to deck dir
+```
+
+For each `s` in `lambda_scale`, the sweep multiplies every prefix's
+`lambda_weights` by `s` and runs a fit. The fit at the maximum-curvature
+point on the log-log L-curve (residual vs. base-λ-weighted `R(x)`) becomes
+the saved best fit — i.e. `/best_fit`, `/params/*`, the `streak_png`, and
+the `profiles_png` all reflect the optimal-λ result.
+
+**Warm-starting.** With `warm_start = true` (default) an unregularized fit
+(`lambda_weights = [0, 0, 0]` for every prefix) is run first and its
+per-prefix parameter profiles seed the initial guess for every λ in the
+sweep. This is far more robust than starting each fit from the deck's
+literal initial guess and avoids path-dependence between sweep points. The
+unregularized fit itself is stored under `/l_curve/unreg/` for inspection.
+
+**Outputs.** Beyond the standard `/best_fit` (the optimal-λ fit), an
+`/l_curve` group is written into the primary HDF5:
+- `/l_curve/lambda_scale`       — (N,)
+- `/l_curve/residual_norm`      — (N,)  data `mean(r²/σ²)` per fit
+- `/l_curve/penalty_norm`       — (N,)  base-λ-weighted `R(x)` per fit
+- `/l_curve/curvature`          — (N,)  log-log curvature (NaN at endpoints)
+- `/l_curve/loss`               — (N,)  raw final objective per fit
+- `/l_curve/best_fits`          — (N, Nk, Nt) forward model per λ
+- `/l_curve/params/<prefix>`    — (N, Nt) parameter profiles per λ
+- `/l_curve/unreg/best_fit`     — (Nk, Nt)  warm-start unreg fit
+- `/l_curve/unreg/params/<prefix>` — (Nt,)
+- `/l_curve/.attrs`: `optimal_index`, `optimal_lambda_scale`, `warm_start`
+
+If `plot_path` is set, a log-log PNG of the L-curve with the corner marked
+is written alongside.
+
+**Mutual exclusion with `[sampling]`.** `[l_curve]` and `[sampling]` cannot
+run in the same invocation — sampling is built around a single MAP point
+and is ill-defined when the regularization strength itself is being swept.
+If both are enabled, sampling is skipped with a warning.
+
 ### `[plotting]` (CLI extension, consumed by `thomson_fit.py`)
 
 ```toml
@@ -352,10 +409,20 @@ shot_num       = 12345
 init_png       = "init.png"
 streak_png     = "streak.png"
 profiles_png   = "profiles.png"
+
+# Option 1 — explicit variable list (recommended).
+# Each key becomes its own subplot, auto-laid-out up to 4 per row.
+# Valid keys are any parameter prefix that appears in the results HDF5
+# (e.g. "n", "Te0", "Ti0", "Ti1", "ui0", "ifract0", "ifract1", "pe0", ...).
+profile_vars   = ["n", "Te0", "Ti0", "ifract0"]
+
+# Option 2 — legacy preset layout (used when profile_vars is absent).
+# "epw" plots n / Te0 / pe0; "iaw" plots a fixed 4×2 IAW grid.
 profile_layout = "epw"           # "epw" | "iaw"
 ```
 
-All four PNG outputs are optional and skipped when not specified.
+`profile_vars` takes precedence over `profile_layout` when both are set.
+All PNG outputs are optional and skipped when not specified.
 
 ### CLI deck extensions (consumed before `build_settings_from_deck`)
 
@@ -469,6 +536,24 @@ land in the same file as the summary:
 Set `[sampling] save_samples = false` to drop these and keep only the
 `/summary/` group.
 
+When an L-curve sweep ran, an `/l_curve` group is written:
+
+```
+/l_curve/lambda_scale           (N,)
+/l_curve/residual_norm          (N,)         data mean(r²/σ²) per fit
+/l_curve/penalty_norm           (N,)         base-λ-weighted R(x) per fit
+/l_curve/curvature              (N,)         log-log curvature (NaN at endpoints)
+/l_curve/loss                   (N,)         raw final objective per fit
+/l_curve/best_fits              (N, Nk, Nt)
+/l_curve/params/<prefix>        (N, Nt)
+/l_curve/unreg/best_fit         (Nk, Nt)     warm-start unreg fit (if used)
+/l_curve/unreg/params/<prefix>  (Nt,)
+attrs: optimal_index, optimal_lambda_scale, warm_start
+```
+
+The top-level `/best_fit` and `/params/*` always correspond to the
+optimal-λ fit (the max-curvature point on the L-curve).
+
 File-level attributes:
 
 ```
@@ -490,12 +575,15 @@ from ThomsonScattering import (
     load_deck,                  # parse a TOML deck → dict
     build_settings_from_deck,   # dict → (data, var, meas, pen, pars, fit, ...)
     run_fit_grad,               # the fit driver
+    compute_L_curve,            # Tikhonov L-curve sweep
     save_fit_results,           # HDF5 writer
     compute_initial_fit,        # forward model at the initial guess
     build_params,               # build a {name: Param} dict from settings
     Param,                      # dataclass: value, min, max, vary
     scattered_power_wavelength, # forward model (units: see § 2)
     spectral_density,           # S(k, omega) (no instrument response)
+    build_sampling_problem,     # wrap a fit problem with a sampling target
+    run_sgld_posterior,         # multi-chain preconditioned SGLD sampler
 )
 ```
 
@@ -504,7 +592,8 @@ Typical scripted use:
 ```python
 deck = load_deck("my_deck.toml")
 (Pkl_data, Pkl_var, meas, pen, pars, fit_kw,
- extras, constraints, out_path) = build_settings_from_deck(deck)
+ extras, constraints, out_path,
+ sampling_settings, l_curve_settings) = build_settings_from_deck(deck)
 
 result, best_fit = run_fit_grad(
     Pkl_data, Pkl_var, meas,
@@ -517,6 +606,25 @@ result, best_fit = run_fit_grad(
 )
 
 save_fit_results(out_path, result, best_fit, time_axis=meas.get("time"))
+```
+
+For an L-curve sweep instead of a single fit:
+
+```python
+import numpy as np
+lc = compute_L_curve(
+    Pkl_data, Pkl_var, meas,
+    penalty_settings=pen,
+    lambda_scale=np.logspace(-3, 2, 21),
+    params_settings=pars,
+    constraints=constraints,
+    extra_params=extras,
+    fit_settings=fit_kw,
+    warm_start=True,
+)
+print("optimal lambda_scale:", lc.lambda_scale[lc.optimal_index])
+save_fit_results(out_path, lc.optimal_result, lc.optimal_best_fit,
+                 l_curve_result=lc)
 ```
 
 `result` is a `SimpleNamespace` with:
@@ -545,7 +653,7 @@ Shared synthetic data lives under [`examples/data/`](examples/data/):
   throughput is also written to
   [`throughput.csv`](examples/data/throughput.csv).
 
-The five example subdirectories, each with its own `fit.toml`/`forward.toml`,
+The six example subdirectories, each with its own `fit.toml`/`forward.toml`,
 `plot.py`, and a per-example `README.md`:
 
 - [`examples/epw_basic/`](examples/epw_basic/) — `data_epw.h5`, no IRF /
@@ -563,6 +671,12 @@ The five example subdirectories, each with its own `fit.toml`/`forward.toml`,
   `iaw_constraints` plus a `[sampling]` block that triggers preconditioned
   SGLD posterior sampling after the MAP. Produces 16/84-percentile bands
   in `plot.py` for free.
+- [`examples/iaw_l_curve/`](examples/iaw_l_curve/) — identical physics to
+  `iaw_constraints` plus `[penalty.Te0]` / `[penalty.Ti0]` and an
+  `[l_curve]` block that runs a Tikhonov sweep over 11 log-spaced
+  `lambda_scale` values, warm-starting from an unregularized fit. The
+  optimal-λ result is saved as the top-level `/best_fit`; the full sweep
+  lands under `/l_curve`. `plot.py` adds a per-λ profile overlay.
 - [`examples/iaw_full/`](examples/iaw_full/) — `data_iaw.h5`, applies IRF
   (from HDF5), throughput (from CSV — demonstrating the file-loading path),
   `notch`, `background_order = 1`, `[probe_beam]` (with `gain_mode = "off"`

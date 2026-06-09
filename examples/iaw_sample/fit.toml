@@ -107,6 +107,12 @@ tol              = 1e-9
 [output]
 path = "fit_result.h5"
 
+[plotting]
+shot_num     = 1
+streak_png   = "spectra.png"
+profiles_png = "params_vs_time.png"
+profile_vars = ["Te0", "Ti0", "ifract0", "ifract1"]
+
 # ── Posterior sampling ─────────────────────────────────────────────────────
 # Temperature defaults to "auto" = 2 / N_pixels_valid, which makes the
 # implicit likelihood the proper Gaussian 0.5 · sum((d - f)² / σ²) and the
