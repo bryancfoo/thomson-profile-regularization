@@ -1,0 +1,84 @@
+# examples/epw_custom_dist/fit.toml — EPW fit with a USER-SUPPLIED distribution
+#
+# The electron species model is a plain Python/JAX function loaded from
+# my_dists.py (path relative to this deck). Its signature
+#     two_temp(x, fhot=0.1, rhot=3.0)
+# is introspected: `fhot` and `rhot` become the fit parameters `fhote0` and
+# `rhote0` (defaults from the function signature, overridden below).
+#
+#     python ThomsonScatteringArbitrary/examples/data/make_data_epw_2temp.py   # one-time
+#     python -m ThomsonScatteringArbitrary.thomson_fit ThomsonScatteringArbitrary/examples/epw_custom_dist/fit.toml
+
+[data]
+path        = "../data/data_epw_2temp.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+time_axis   = "../data/data_epw_2temp.h5:time"
+
+[species]
+electron = [{ model = "my_dists.py:two_temp", x_max = 14.0, n_points = 3001 }]
+ion      = ["maxwellian"]
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1]
+ion_a            = [1]
+probe_wavelength = 2.6325e-7
+probe_vec        = [0.0,       0.0, 1.0]
+scatter_vec      = [0.8660254, 0.0, 0.5]
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+wavelengths      = "../data/data_epw_2temp.h5:wavelengths"
+normalization_type = "max"
+
+[params.n]
+value = 5.0e19
+vary  = false
+
+# Drifts and fractions pinned (see iaw_kappa deck note).
+[params.ue0]
+value = 0.0
+vary  = false
+[params.ui0]
+value = 0.0
+vary  = false
+[params.efract0]
+value = 1.0
+vary  = false
+[params.ifract0]
+value = 1.0
+vary  = false
+
+[params.Te0]
+value = 350.0
+min   = 100.0
+max   = 1200.0
+vary  = true
+
+[params.Ti0]
+value = 100.0
+vary  = false                                  # EPW shape insensitive to Ti
+
+[params.fhote0]                                # hot-electron fraction
+value = 0.10
+min   = 0.0
+max   = 0.5
+vary  = true
+
+[params.rhote0]                                # hot/cold temperature ratio
+value = 4.0
+vary  = false                                  # fixed: degenerate with fhot at
+                                               # this noise level
+[fit]
+optimizer = "lbfgs"
+max_iter  = 600
+tol       = 1e-10
+
+[output]
+path = "fit_result.h5"
+
+[plotting]
+shot_num     = "2temp-demo"
+streak_png   = "streak.png"
+profiles_png = "profiles.png"
+profile_vars = ["Te0", "fhote0"]

@@ -1,0 +1,86 @@
+# examples/epw_basic/fit.toml — minimal LBFGS → NUTS fit of the antiStokes EPW
+#
+# Pairs with examples/data/data_epw.h5 (built by examples/data/make_data_epw.py) and
+# examples/forward_only/forward.toml.  Only ne and Te are free — small enough
+# (20 free parameters) that LBFGS converges in seconds and NUTS warmup
+# finishes quickly, so it's the right test case to verify the *_nuts
+# pipeline end-to-end on your system.
+#
+# Run:
+#     python examples/data/make_data_epw.py            # one-time: generate data_epw.h5
+#     python thomson_fit.py examples/epw_basic/fit.toml
+
+[data]
+path        = "../../../examples/data/data_epw.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1]              # protons (single ion species)
+ion_a            = [1]
+# Probe wavelength in METERS (codebase convention).  263.25 nm = 2.6325e-7 m.
+probe_wavelength = 2.6325e-7
+probe_vec        = [0.0,        0.0, 1.0]
+scatter_vec      = [0.8660254,  0.0, 0.5]   # 60° from probe in x-z plane
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+wavelengths      = "../../../examples/data/data_epw.h5:wavelengths"
+normalization_type = "max"
+
+# ── Free parameters: just n and Te0.  Everything else is fixed. ──────────────
+[params.n]
+value = 5.0e19                      # truth varies 3e19 – 7e19
+min   = 1.0e19
+max   = 1.0e20
+vary  = true
+
+[params.Te0]
+value = 300.0                       # truth varies 200 – 400 eV
+min   = 50.0
+max   = 1500.0
+vary  = true
+
+# Fixed parameters — held at their physical / synthetic values.
+[params.Ti0]
+value = 100.0
+vary  = false
+
+[params.ifract0]
+value = 1.0
+vary  = false
+
+[params.efract0]
+value = 1.0
+vary  = false
+
+[params.ue0]
+value = 0.0
+vary  = false
+
+[params.ui0]
+value = 0.0
+vary  = false
+
+[params.pe0]
+value = 2.0
+vary  = false
+
+[params.pi0]
+value = 2.0
+vary  = false
+
+# ── Optimizer: LBFGS for the MAP ─────────────────────────────────────────────
+[fit]
+optimizer = "lbfgs"
+max_iter  = 500
+tol       = 1e-10
+
+[output]
+path = "fit_result.h5"
+
+[plotting]
+shot_num     = 1
+streak_png   = "spectra.png"
+profiles_png = "params_vs_time.png"
+profile_vars = ["n", "Te0"]

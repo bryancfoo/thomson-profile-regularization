@@ -1,0 +1,68 @@
+# examples/forward_only/forward.toml — minimal antiStokes EPW forward model
+#
+# Re-computes the synthetic spectrum stored in examples/data/data_epw.h5 directly from
+# the deck's [profiles] block.  Use this to sanity-check that the data file,
+# wavelength window, and geometry agree with the fitter's view of the model.
+#
+#     python thomson_forward.py examples/forward_only/forward.toml
+#
+# Probe:        263.25 nm
+# Scattering:   60° between probe and detector directions
+# Window:       235–262 nm  (antiStokes EPW peak only — no Stokes, no IAW)
+# Species:      one electron, one ion (protons)
+# Profiles:     ne and Te linearly ramped; everything else held constant.
+
+[profiles]
+time   = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+# Electron density (cm^-3) — linearly varied from 3e19 to 7e19
+ne = [3.0e19, 3.444e19, 3.889e19, 4.333e19, 4.778e19,
+      5.222e19, 5.667e19, 6.111e19, 6.556e19, 7.0e19]
+
+# Electron temperature (eV) — linearly varied from 200 to 400
+Te = [200.0, 222.2, 244.4, 266.7, 288.9,
+      311.1, 333.3, 355.6, 377.8, 400.0]
+
+# Ion temperature (eV) — fixed.  EPW shape is insensitive to Ti.
+Ti = [[100.0, 100.0, 100.0, 100.0, 100.0,
+       100.0, 100.0, 100.0, 100.0, 100.0]]
+
+# Flow velocities — all zero
+ue = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+ui = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
+# Super-Gaussian exponents — Maxwellian
+pe = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+pi = [[2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]]
+
+# Species fractions (single species each)
+efract = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+ifract = [[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1]              # protons
+ion_a            = [1]              # amu
+# Probe wavelength in METERS (codebase convention).  263.25 nm = 2.6325e-7 m.
+probe_wavelength = 2.6325e-7
+
+# 60° scattering: probe along +z, scatter at 60° from probe (in x–z plane).
+# cos(60°) = 0.5, sin(60°) ≈ 0.8660254.
+probe_vec        = [0.0,        0.0, 1.0]
+scatter_vec      = [0.8660254,  0.0, 0.5]
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+
+# antiStokes EPW window (Nk=200).  Wider than strictly needed so the line is
+# well inside the window across the full Te / ne sweep.
+wavelengths = "../../../examples/data/data_epw.h5:wavelengths"
+
+normalization_type = "max"
+
+[output]
+path = "forward_streak.png"
+
+[plotting]
+figsize = [10, 5]
+dpi = 150
+cmap = "viridis"
