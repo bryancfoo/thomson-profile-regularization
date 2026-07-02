@@ -124,14 +124,19 @@ def _spectral_density(
 
     k2d = k[0]  # (Nt, Nk)
 
+    # Fused disp+reduced per species: the general (quadrature) models
+    # evaluate both in a single traversal of the time axis instead of two.
+    e_dr = [e_models[s].disp_and_reduced(zetae[s], e_shapes[s])
+            for s in range(Nelectrons)]
+    i_dr = [i_models[s].disp_and_reduced(zetai[s], i_shapes[s])
+            for s in range(Nions)]
+
     chiE = [
-        wpe_sq[s] / (vTe[s] * k2d) ** 2
-        * e_models[s].disp(zetae[s], e_shapes[s])
+        wpe_sq[s] / (vTe[s] * k2d) ** 2 * e_dr[s][0]
         for s in range(Nelectrons)
     ]
     chiI = [
-        wpi_sq[s] / (vTi[s] * k2d) ** 2
-        * i_models[s].disp(zetai[s], i_shapes[s])
+        wpi_sq[s] / (vTi[s] * k2d) ** 2 * i_dr[s][0]
         for s in range(Nions)
     ]
 
@@ -148,13 +153,13 @@ def _spectral_density(
     econtr = [
         efract[s] * 2 * jnp.pi / (k2d * vTe[s])
         * e_screen
-        * e_models[s].reduced(zetae[s], e_shapes[s])
+        * e_dr[s][1]
         for s in range(Nelectrons)
     ]
     icontr = [
         ifract[s] * 2 * jnp.pi * ion_z[s] / (k2d * vTi[s])
         * i_screen
-        * i_models[s].reduced(zetai[s], i_shapes[s])
+        * i_dr[s][1]
         for s in range(Nions)
     ]
 

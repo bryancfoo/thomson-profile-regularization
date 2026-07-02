@@ -569,12 +569,17 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
                             save_samples=True):
     """Write posterior summary + (optionally) raw samples into ``fh``.
 
-    Writes the ``/summary/...`` group always. When ``save_samples`` is True,
-    additionally writes the full posterior chains under ``/samples/<prefix>``
-    plus ``/u_samples``, ``/log_probs``, ``/step_size_history``,
-    ``/varying_keys``, and ``/u_chain_init``.
+    Writes the ``/summary/...`` group, ``/varying_keys``, and (when available)
+    the MAP-Hessian ``/hessian_u`` + ``/hessian_ref`` and the ``/laplace``
+    group always. When ``save_samples`` is True and the result carries chains
+    (``method == "mcmc"``), additionally writes the full posterior chains
+    under ``/samples/<prefix>`` plus ``/u_samples``, ``/log_probs``,
+    ``/step_size_history``, and ``/u_chain_init``. Laplace-only results
+    (``method == "laplace"``) have no chains; their summary std/percentiles
+    come from the delta-method covariance.
     """
     import h5py
+    has_samples = getattr(samp, "samples_phys", None) is not None
     summary = fh.create_group("summary")
     for stat in ("mean", "std", "p16", "p50", "p84"):
         g = summary.create_group(stat)
@@ -583,48 +588,107 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
     corr_g = summary.create_group("correlations")
     for prefix, s in samp.summary.items():
         corr_g.create_dataset(prefix, data=_np.asarray(s["corr_intra"]))
-    rhat_g = summary.create_group("rhat")
-    ess_g = summary.create_group("ess")
-    for prefix in samp.summary:
-        rhat_g.create_dataset(prefix, data=_np.asarray(samp.rhat[prefix]))
-        ess_g.create_dataset(prefix, data=_np.asarray(samp.ess[prefix]))
+    if getattr(samp, "rhat", None) is not None:
+        rhat_g = summary.create_group("rhat")
+        ess_g = summary.create_group("ess")
+        for prefix in samp.summary:
+            rhat_g.create_dataset(prefix, data=_np.asarray(samp.rhat[prefix]))
+            ess_g.create_dataset(prefix, data=_np.asarray(samp.ess[prefix]))
     if save_cross_corr:
-        prefixes = list(samp.summary.keys())
-        cols = []
-        for p in prefixes:
-            v = samp.samples_phys[p]
-            cols.append(v.reshape(-1, v.shape[-1]))  # (nc*ns, Nt)
-        flat = _np.concatenate(cols, axis=1)         # (nc*ns, sum Nt)
-        with _np.errstate(divide="ignore", invalid="ignore"):
-            cc = _np.corrcoef(flat.T)
-        cc = _np.where(_np.isfinite(cc), cc, 0.0)
-        _np.fill_diagonal(cc, 1.0)
-        summary.create_dataset("cross_correlations", data=cc)
-        # Index strings so a reader can decode the row/col order.
-        idx_labels = []
-        for p in prefixes:
-            v = samp.samples_phys[p]
-            for t in range(v.shape[-1]):
-                idx_labels.append(f"{p}[t={t}]")
-        summary.create_dataset(
-            "cross_correlations_labels",
-            data=_np.array(idx_labels, dtype=h5py.string_dtype()),
+        if has_samples:
+            prefixes = list(samp.summary.keys())
+            cols = []
+            for p in prefixes:
+                v = samp.samples_phys[p]
+                cols.append(v.reshape(-1, v.shape[-1]))  # (nc*ns, Nt)
+            flat = _np.concatenate(cols, axis=1)         # (nc*ns, sum Nt)
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                cc = _np.corrcoef(flat.T)
+            cc = _np.where(_np.isfinite(cc), cc, 0.0)
+            _np.fill_diagonal(cc, 1.0)
+            idx_labels = []
+            for p in prefixes:
+                v = samp.samples_phys[p]
+                for t in range(v.shape[-1]):
+                    idx_labels.append(f"{p}[t={t}]")
+        elif getattr(samp, "cov_phys", None) is not None:
+            # Laplace-only: derive the cross-correlation from Σ_phys.
+            sig = _np.sqrt(_np.clip(_np.diag(samp.cov_phys), 0.0, None))
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                cc = samp.cov_phys / _np.outer(sig, sig)
+            cc = _np.where(_np.isfinite(cc), cc, 0.0)
+            _np.fill_diagonal(cc, 1.0)
+            idx_labels = list(samp.cov_phys_labels)
+        else:
+            cc = None
+        if cc is not None:
+            summary.create_dataset("cross_correlations", data=cc)
+            # Index strings so a reader can decode the row/col order.
+            summary.create_dataset(
+                "cross_correlations_labels",
+                data=_np.array(idx_labels, dtype=h5py.string_dtype()),
+            )
+
+    summary.attrs["method"]      = str(getattr(samp, "method", "mcmc"))
+    summary.attrs["kernel"]      = str(getattr(samp, "kernel", "sgld"))
+    summary.attrs["temperature"] = float(samp.temperature)
+    summary.attrs["wall_time_s"] = float(samp.wall_time)
+    if has_samples:
+        summary.attrs["n_chains"]       = int(samp.n_chains)
+        summary.attrs["n_samples"]      = int(samp.n_samples)
+        summary.attrs["burn_in"]        = int(samp.burn_in)
+        summary.attrs["thin"]           = int(samp.thin)
+        summary.attrs["step_size_final"] = float(samp.step_size_final)
+        summary.attrs["precond"]        = str(samp.precond)
+        summary.attrs["max_rhat"]       = float(samp.max_rhat)
+        summary.attrs["max_rhat_key"]   = str(samp.max_rhat_key)
+        summary.attrs["min_ess"]        = float(samp.min_ess)
+        summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
+        if getattr(samp, "kernel", "sgld") in ("hmc", "mala"):
+            summary.attrs["n_leapfrog"]   = int(samp.n_leapfrog)
+            summary.attrs["accept_rate"]  = _np.asarray(samp.accept_rate)
+            summary.attrs["n_divergent"]  = int(samp.n_divergent)
+
+    # Always save the param ordering (it labels both the Hessian axes and the
+    # u-space arrays) and the full Hessian of the log-posterior at the MAP.
+    # The Hessian is a single (D, D) matrix; -inv(hessian_u) is the Laplace
+    # covariance in u-space. Its row/col order matches /varying_keys.
+    fh.create_dataset(
+        "varying_keys",
+        data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
+    )
+    if getattr(samp, "hessian_u", None) is not None:
+        fh.create_dataset("hessian_u",   data=_np.asarray(samp.hessian_u))
+        fh.create_dataset("hessian_ref", data=_np.asarray(samp.hessian_ref))
+
+    # Laplace physical-parameter covariance at the MAP: the full (singular) P×P
+    # matrix plus per-prefix 1σ error bars (sqrt of its diagonal), so they sit
+    # alongside summary/std. Row/col order of cov_phys matches cov_phys_labels.
+    # Non-identified (flat) directions are exported as relative physical
+    # loadings so a reader can see which parameter combinations the data
+    # cannot pin down.
+    if getattr(samp, "cov_phys", None) is not None:
+        lap = fh.create_group("laplace")
+        lap.create_dataset("cov_phys", data=_np.asarray(samp.cov_phys))
+        lap.create_dataset(
+            "cov_phys_labels",
+            data=_np.array(samp.cov_phys_labels, dtype=h5py.string_dtype()),
         )
+        sig_g = lap.create_group("sigma")
+        for prefix, arr in samp.laplace_sigma.items():
+            sig_g.create_dataset(prefix, data=_np.asarray(arr))
+        lap.attrs["n_nonidentified"] = int(getattr(samp, "n_nonidentified", 0))
+        loadings = getattr(samp, "nonid_loadings", None)
+        if loadings is not None and len(loadings):
+            lap.create_dataset("nonidentified_loadings",
+                               data=_np.asarray(loadings))
+            lap.create_dataset(
+                "nonidentified_descriptions",
+                data=_np.array(getattr(samp, "nonid_descriptions", []),
+                               dtype=h5py.string_dtype()),
+            )
 
-    summary.attrs["n_chains"]       = int(samp.n_chains)
-    summary.attrs["n_samples"]      = int(samp.n_samples)
-    summary.attrs["burn_in"]        = int(samp.burn_in)
-    summary.attrs["thin"]           = int(samp.thin)
-    summary.attrs["temperature"]    = float(samp.temperature)
-    summary.attrs["step_size_final"] = float(samp.step_size_final)
-    summary.attrs["precond"]        = str(samp.precond)
-    summary.attrs["max_rhat"]       = float(samp.max_rhat)
-    summary.attrs["max_rhat_key"]   = str(samp.max_rhat_key)
-    summary.attrs["min_ess"]        = float(samp.min_ess)
-    summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
-    summary.attrs["wall_time_s"]    = float(samp.wall_time)
-
-    if save_samples:
+    if save_samples and has_samples:
         samples_grp = fh.create_group("samples")
         for prefix, arr in samp.samples_phys.items():
             samples_grp.create_dataset(prefix, data=_np.asarray(arr))
@@ -632,7 +696,3 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
         fh.create_dataset("log_probs",         data=_np.asarray(samp.log_probs))
         fh.create_dataset("step_size_history", data=_np.asarray(samp.step_size_history))
         fh.create_dataset("u_chain_init",      data=_np.asarray(samp.u_chain_init))
-        fh.create_dataset(
-            "varying_keys",
-            data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
-        )

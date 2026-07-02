@@ -61,7 +61,10 @@ from .distributions import (
 )
 from .fitting import run_fit_grad, build_params, compute_initial_fit, Param
 from .forward import scattered_power_wavelength, spectral_density
-from .sampling import build_sampling_problem, run_sgld_posterior
+from .sampling import (
+    build_sampling_problem, run_mcmc_posterior, run_sgld_posterior,
+    run_laplace_posterior,
+)
 from .l_curve import compute_L_curve
 
 __all__ = [
@@ -70,6 +73,7 @@ __all__ = [
     "resolve_distribution", "resolve_models",
     "run_fit_grad", "build_params", "compute_initial_fit", "Param",
     "scattered_power_wavelength", "spectral_density",
-    "build_sampling_problem", "run_sgld_posterior",
+    "build_sampling_problem", "run_mcmc_posterior", "run_sgld_posterior",
+    "run_laplace_posterior",
     "compute_L_curve",
 ]

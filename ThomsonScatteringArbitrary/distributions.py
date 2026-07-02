@@ -102,6 +102,14 @@ class Distribution:
     def reduced(self, zeta, shape):
         raise NotImplementedError
 
+    def disp_and_reduced(self, zeta, shape):
+        """(disp, reduced) in one call.
+
+        The forward model needs both; general (quadrature) models override
+        this to evaluate them in a single traversal of the time axis.
+        """
+        return self.disp(zeta, shape), self.reduced(zeta, shape)
+
     def __repr__(self):
         return f"<{type(self).__name__} {self.name!r} shape={self.shape_param_names}>"
 
@@ -176,10 +184,23 @@ class GeneralDistribution(Distribution):
     The dispersion integral runs on a fixed Simpson grid over
     [−x_max, x_max]; choose ``x_max`` large enough that g' is negligible
     outside (raise it for fat-tailed families like kappa).
+
+    ``time_batch`` controls how many time rows are vectorized together when
+    traversing the time axis (see :meth:`_map_time`). The default ``"auto"``
+    vectorizes the whole time axis when the quadrature slab fits a memory
+    budget and falls back to a sequential row map otherwise — measured on a
+    memory-bandwidth-bound CPU box, those two extremes both beat intermediate
+    chunk sizes, so pick an explicit int only if you know your machine.
     """
 
+    #: "auto" memory budget for the full-vmap path: Nt·Nk·Nx complex slabs
+    #: with a fudge factor for live intermediates + AD residuals + aperture
+    #: batching. Above this, fall back to the sequential row map.
+    AUTO_MEM_BUDGET_BYTES = 4 << 30
+
     def __init__(self, g, shape_param_names, name=None,
-                 shape_param_defaults=None, x_max=10.0, n_points=2001):
+                 shape_param_defaults=None, x_max=10.0, n_points=2001,
+                 time_batch="auto"):
         self.g = g
         self.shape_param_names = tuple(shape_param_names)
         self.name = name or getattr(g, "__name__", "custom")
@@ -187,6 +208,9 @@ class GeneralDistribution(Distribution):
         _validate_shape_names(self.shape_param_names, self.name)
         self.x_max = float(x_max)
         self.n_points = int(n_points)
+        if time_batch != "auto":
+            time_batch = max(1, int(time_batch))
+        self.time_batch = time_batch
         self.x_grid, self.weights = simpson_grid(self.x_max, self.n_points)
 
         n_shape = len(self.shape_param_names)
@@ -195,15 +219,28 @@ class GeneralDistribution(Distribution):
         self._gp_v = vmap(jax.grad(g, argnums=0), in_axes=in_axes)
         self._gpp_v = vmap(jax.grad(jax.grad(g, argnums=0), argnums=0),
                            in_axes=in_axes)
+        # With no shape parameters g' on the quadrature grid is a constant:
+        # evaluate it once here instead of once per time row per forward call.
+        self._gp_grid_const = (self._gp_v(self.x_grid)
+                               if not self.shape_param_names else None)
+
+    def _gp_grid(self, s_row):
+        if self._gp_grid_const is not None:
+            return self._gp_grid_const
+        return self._gp_v(self.x_grid, *s_row)
 
     def _map_time(self, fn, zeta, shape):
         """Apply ``fn(zeta_row, shape_scalars)`` over the time axis.
 
-        zeta is (Nt, Nk) and each shape entry is (Nt,) (or scalar). Time is
-        mapped sequentially with ``lax.map`` so the (Nk, Nx) quadrature slab
-        is the peak memory, not (Nt, Nk, Nx). Any extra leading batch dims
+        zeta is (Nt, Nk) and each shape entry is (Nt,) (or scalar). With
+        ``time_batch="auto"`` (default) the whole time axis is vectorized in
+        one ``lax.map`` chunk (≈ vmap) when the estimated quadrature memory
+        fits ``AUTO_MEM_BUDGET_BYTES``, and mapped sequentially otherwise so
+        the peak slab stays (Nk, Nx), not (Nt, Nk, Nx). An explicit int
+        chunks ``time_batch`` rows at a time. Any extra leading batch dims
         (e.g. the aperture vmap) are handled by JAX's batching rules without
-        this code seeing them.
+        this code seeing them (but they do multiply the actual memory — the
+        auto budget includes a fudge factor for that).
         """
         shape = tuple(jnp.broadcast_to(jnp.asarray(s), zeta.shape[:-1])
                       for s in shape)
@@ -213,11 +250,17 @@ class GeneralDistribution(Distribution):
         def _one(args):
             z_row, s_row = args
             return fn(z_row, s_row)
-        return lax.map(_one, (zeta, shape))
+
+        batch = self.time_batch
+        if batch == "auto":
+            nt, nk = int(zeta.shape[0]), int(zeta.shape[-1])
+            slab = nt * nk * self.n_points * 16 * 8   # complex128 × fudge
+            batch = nt if slab <= self.AUTO_MEM_BUDGET_BYTES else None
+        return lax.map(_one, (zeta, shape), batch_size=batch)
 
     def disp(self, zeta, shape):
         def _disp_row(z_row, s_row):
-            gp_grid = self._gp_v(self.x_grid, *s_row)
+            gp_grid = self._gp_grid(s_row)
             gp_z = self._gp_v(z_row, *s_row)
             gpp_z = self._gpp_v(z_row, *s_row)
             return hilbert_disp(z_row, gp_z, gpp_z, gp_grid,
@@ -228,6 +271,19 @@ class GeneralDistribution(Distribution):
         def _red_row(z_row, s_row):
             return self._g_v(z_row, *s_row)
         return self._map_time(_red_row, jnp.asarray(zeta), shape)
+
+    def disp_and_reduced(self, zeta, shape):
+        """Fused (disp, reduced): one traversal of the time axis instead of
+        two, sharing the shape broadcast and letting XLA fuse the g/g'
+        evaluations at the phase velocities."""
+        def _row(z_row, s_row):
+            gp_grid = self._gp_grid(s_row)
+            g_z = self._g_v(z_row, *s_row)
+            gp_z = self._gp_v(z_row, *s_row)
+            gpp_z = self._gpp_v(z_row, *s_row)
+            return (hilbert_disp(z_row, gp_z, gpp_z, gp_grid,
+                                 self.x_grid, self.weights), g_z)
+        return self._map_time(_row, jnp.asarray(zeta), shape)
 
     def check_normalization(self, shape_values, atol=1e-3):
         """Eager sanity check: ∫ g dx on the quadrature grid vs 1.
@@ -277,6 +333,7 @@ def _make_kappa(opts):
         shape_param_defaults={"kappa": {"value": 4.0, "min": 1.6, "max": 50.0}},
         x_max=opts.get("x_max", 20.0),
         n_points=opts.get("n_points", 4001),
+        time_batch=opts.get("time_batch", "auto"),
     )
 
 
@@ -286,6 +343,7 @@ def _make_super_gaussian_numeric(opts):
         shape_param_defaults={"p": {"value": 2.0, "min": 2.0, "max": 5.0}},
         x_max=opts.get("x_max", 10.0),
         n_points=opts.get("n_points", 2001),
+        time_batch=opts.get("time_batch", "auto"),
     )
 
 
@@ -357,7 +415,8 @@ def resolve_distribution(spec, base_dir=None):
     - Distribution instance               → returned as-is
     - ``"maxwellian"`` etc.               → registry model
     - ``"file.py:func"``                  → custom callable (general path)
-    - dict with key ``"model"`` plus options (``x_max``, ``n_points``)
+    - dict with key ``"model"`` plus options (``x_max``, ``n_points``,
+      ``time_batch``)
     """
     if isinstance(spec, Distribution):
         return spec
@@ -377,6 +436,7 @@ def resolve_distribution(spec, base_dir=None):
             shape_param_defaults=defaults,
             x_max=opts.get("x_max", 10.0),
             n_points=opts.get("n_points", 2001),
+            time_batch=opts.get("time_batch", "auto"),
         )
     raise ValueError(
         f"Unknown distribution model {spec!r}. Use one of "

@@ -226,3 +226,45 @@ every k iters.
 - Spike/validation scripts: `spike_shard.py` (time-shard equivalence + speedup),
   `validate_lcurve.py` / `bench_lcurve.py` (pool equivalence + speedup),
   `validate_shard.py` (wired 1-vs-N-device equivalence).
+
+---
+
+# Implemented: general-path forward + sampler speedups (2026-07-02)
+
+## Quadrature (general-distribution) forward model
+Measured on the kappa example (Nt=8, Nk=200, Nx=1001, 1 angle), val_and_grad:
+**54.0 → 28.9 ms (1.87×)**, objective bit-identical, gradient rel ~4e-14
+(float reassociation from batching). Three changes in
+`ThomsonScattering/distributions.py` + `forward.py`:
+
+1. **Fused `disp_and_reduced`** — the forward model needs both the dispersion
+   integral and g(zeta) per species; they now share one traversal of the
+   time axis instead of two.
+2. **`time_batch` control of the time-axis map** (`_map_time`). Default
+   `"auto"`: vectorize the whole time axis (`lax.map` in one chunk ≈ vmap)
+   when the estimated quadrature slab fits `AUTO_MEM_BUDGET_BYTES` (4 GiB
+   incl. fudge for AD residuals/aperture batching), else fall back to the
+   sequential row map. Measured (Nt=64 tiled kappa): sequential 317 ms,
+   full-vmap 247 ms, but intermediate chunks (8/16/32) 420–431 ms — this
+   box is memory-bandwidth bound and chunked scan+vmap is the worst of both
+   worlds, hence auto picks only the two extremes. Override per species:
+   `i_models = [{model = "kappa", time_batch = 16}]`.
+3. **Constant g′-grid precompute** for distributions with no shape
+   parameters (custom fixed-form g): evaluated once at model build instead
+   of per time row per call.
+
+## Sampler (`ThomsonScattering/sampling.py`)
+- **Chunked `lax.scan` main loops** for all kernels: the old loop paid one
+  jitted call + a host sync per iteration (`float(r_t)`, `np.asarray(us)`);
+  now the only host↔device traffic is one transfer per ~100-iteration chunk,
+  with step-size adaptation on-device. The pmap chain backend runs the same
+  scan inside `pmap` (cross-chain reductions via `pmean`/`all_gather`).
+- **Batched FD Hessian setup**: the 2·D finite-difference gradient
+  evaluations (needed on the general path where `jax.hessian` is
+  compile-prohibitive) run through `lax.map(batch_size=16)` instead of a
+  serial Python loop; the Hessian is computed once and reused for the
+  preconditioner and the Laplace covariance.
+- **HMC / MALA kernels** (`kernel = "hmc"` default): fewer, less-correlated
+  samples for the same error bars, no step-size bias, and acceptance-rate
+  dual averaging replaces the drift/noise heuristic. `method = "laplace"`
+  skips MCMC entirely (MAP Hessian + delta method) — error bars in seconds.

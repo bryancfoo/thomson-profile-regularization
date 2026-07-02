@@ -1,14 +1,16 @@
-"""Preconditioned SGLD posterior sampler for Thomson-scattering fits.
+"""Posterior samplers for Thomson-scattering fits: HMC / MALA / SGLD + Laplace.
 
 Builds on :func:`ThomsonScatteringArbitrary.fitting._build_grad_problem`: takes the
 ``SimpleNamespace`` it returns and produces a JAX-jitted, Jacobian-corrected
-sampling target plus a multi-chain SGLD runner with R-hat/ESS diagnostics
+sampling target plus a multi-chain MCMC runner with R-hat/ESS diagnostics
 and per-sample constraint resolution.
 
 Public API
 ----------
 - :func:`build_sampling_problem` — wrap a fit problem with a sampling target.
-- :func:`run_sgld_posterior` — top-level multi-chain sampler.
+- :func:`run_mcmc_posterior` — top-level multi-chain sampler (HMC/MALA/SGLD).
+- :func:`run_sgld_posterior` — backward-compatible alias (``kernel="sgld"``).
+- :func:`run_laplace_posterior` — Hessian-only error bars (no chains).
 
 Notes on the sampling target
 ----------------------------
@@ -25,13 +27,25 @@ the LBFGS MAP location; the only mode shift comes from the Jacobian term,
 and at the default temperature it is ~10⁻⁵ in u-space (well below a
 posterior std).
 
-Rolling our own SGLD (vs. blackjax) keeps full control over the bijector
+Kernels
+-------
+- ``hmc`` (default): leapfrog trajectories with the Hessian preconditioner as
+  inverse mass matrix, Metropolis-corrected, dual-averaging step-size
+  adaptation on the acceptance rate. Trajectory length is jittered uniformly
+  in [1, n_leapfrog] each iteration to avoid resonances. Non-finite
+  trajectory energies are rejected and counted as divergences.
+- ``mala``: HMC with a single leapfrog step (Metropolis-adjusted Langevin).
+- ``sgld``: the legacy unadjusted Langevin kernel with the drift/noise-ratio
+  Robbins-Monro step adaptation. Kept for reproducibility of old runs; its
+  samples carry an O(step_size) discretization bias that the Metropolis
+  kernels do not.
+
+Rolling our own kernels (vs. blackjax) keeps full control over the bijector
 Jacobian and adds no new dependency.
 """
 from __future__ import annotations
 
 import time
-from functools import partial
 from types import SimpleNamespace
 
 import jax as _jax
@@ -40,7 +54,7 @@ _jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
-from jax import jit, value_and_grad, vmap, grad, pmap
+from jax import jit, lax, value_and_grad, vmap, pmap
 
 from .fitting import _log_det_jac_u
 from .parallel import serial_requested
@@ -124,44 +138,44 @@ def build_sampling_problem(problem, *, temperature=None):
     )
 
 
-# ─── preconditioner ─────────────────────────────────────────────────────────
+# ─── Hessian machinery ──────────────────────────────────────────────────────
 
-def _diag_hessian_fd(problem_s, u_ref, *, h=1e-4):
-    """Diagonal Hessian via central finite differences of the gradient.
+def _batched_grads(problem_s, pts, *, batch_size=16):
+    """Gradients of ``target_log_prob`` at a stack of points.
+
+    pts : (N, D) → (N, D). Evaluated with ``lax.map(..., batch_size=)`` so the
+    points are vmapped in chunks: bounded memory, but no per-point Python
+    dispatch (the old FD loop paid one jitted call per point, which dominated
+    on the general-distribution path).
+    """
+    grad_fn = lambda u: problem_s.target_log_prob_and_grad(u)[1]
+    mapped = jit(lambda xs: lax.map(grad_fn, xs, batch_size=batch_size))
+    return mapped(jnp.asarray(pts))
+
+
+def _full_hessian_fd(problem_s, u_ref, *, h=1e-4, batch_size=16):
+    """Full Hessian via central finite differences of the gradient.
 
     Avoids JAX's 2nd-derivative rules entirely — works when the forward
     model contains operators whose Hessian isn't implemented (e.g.
     ``gammaincc`` w.r.t. its first argument, which trips a
     ``NotImplementedError: igamma_grad_a`` when ``pe``/``pi`` are free).
 
-    Cost: 2·D jitted gradient evaluations. One-time at sampler setup.
+    Cost: 2·D gradient evaluations, batched (see :func:`_batched_grads`).
     """
+    u_ref = jnp.asarray(u_ref)
     D = int(u_ref.shape[0])
-    grad_fn = lambda u: problem_s.target_log_prob_and_grad(u)[1]
-    h_diag = np.zeros(D, dtype=np.float64)
-    for j in range(D):
-        e = jnp.zeros(D, dtype=u_ref.dtype).at[j].set(h)
-        gp = np.asarray(grad_fn(u_ref + e))
-        gm = np.asarray(grad_fn(u_ref - e))
-        h_diag[j] = (gp[j] - gm[j]) / (2 * h)
-    return jnp.asarray(h_diag)
-
-
-def _full_hessian_fd(problem_s, u_ref, *, h=1e-4):
-    """Full Hessian via central finite differences of the gradient.
-
-    Same idea as :func:`_diag_hessian_fd` but builds the dense matrix.
-    Cost: 2·D jitted gradient evaluations.
-    """
-    D = int(u_ref.shape[0])
-    grad_fn = lambda u: problem_s.target_log_prob_and_grad(u)[1]
-    H = np.zeros((D, D), dtype=np.float64)
-    for j in range(D):
-        e = jnp.zeros(D, dtype=u_ref.dtype).at[j].set(h)
-        gp = np.asarray(grad_fn(u_ref + e))
-        gm = np.asarray(grad_fn(u_ref - e))
-        H[:, j] = (gp - gm) / (2 * h)
+    eye_h = jnp.eye(D, dtype=u_ref.dtype) * h
+    pts = jnp.concatenate([u_ref[None, :] + eye_h, u_ref[None, :] - eye_h])
+    G = _batched_grads(problem_s, pts, batch_size=batch_size)     # (2D, D)
+    H = (G[:D] - G[D:]).T / (2 * h)                               # column j = ∂g/∂u_j
     return jnp.asarray(0.5 * (H + H.T))
+
+
+def _diag_hessian_fd(problem_s, u_ref, *, h=1e-4, batch_size=16):
+    """Diagonal of the finite-difference Hessian (same 2·D gradient cost)."""
+    return jnp.diag(_full_hessian_fd(problem_s, u_ref, h=h,
+                                     batch_size=batch_size))
 
 
 def _prefer_fd_hessian(problem_s):
@@ -179,69 +193,172 @@ def _prefer_fd_hessian(problem_s):
     return any(isinstance(m, GeneralDistribution) for m in models)
 
 
-def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
-                                fallback=1.0):
-    """Diagonal preconditioner from |H(target_log_prob)(u_ref)|.
+def _full_hessian(problem_s, u_ref):
+    """Full Hessian of ``target_log_prob`` at ``u_ref`` (analytic; FD fallback).
 
-    Returns ``M_diag`` of shape (D,) with ``M_diag[i] = 1 / max(|H_ii|, floor)``.
-
-    Tries JAX's analytical Hessian first; falls back to a 1st-derivative
-    finite-difference diagonal when JAX hits a missing 2nd-derivative rule
-    (e.g. ``gammaincc`` w.r.t. ``a`` with free ``pe``/``pi``), or skips it
+    This is the Hessian of the *temperature-scaled, Jacobian-corrected*
+    log-posterior, so ``-inv(H)`` is the Laplace covariance in u-space and the
+    eigenvalues should be negative at a well-formed MAP. Symmetrized and
+    NaN-cleaned. Falls back to (batched) finite differences when JAX lacks a
+    2nd-derivative rule for the forward model, or skips the analytic attempt
     outright when any species uses the general quadrature path (where the
-    analytic Hessian's compile time is prohibitive). Non-finite entries are
-    replaced with ``fallback`` so a single bad coordinate doesn't NaN the
-    entire preconditioner.
+    analytic Hessian's compile time is prohibitive).
     """
     if _prefer_fd_hessian(problem_s):
-        print("  [precond=diag_hessian] general-path distribution present; "
-              "using finite-difference diagonal.")
-        h_diag = jnp.abs(_diag_hessian_fd(problem_s, u_ref))
-        h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
-        M = 1.0 / jnp.maximum(h_diag, floor)
-        return jnp.where(jnp.isfinite(M), M, 1.0)
-    try:
-        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
-        h_diag = jnp.abs(jnp.diag(H))
-    except NotImplementedError as err:
-        print(f"  [precond=diag_hessian] analytical Hessian unavailable "
-              f"({err}); falling back to finite-difference diagonal.")
-        h_diag = jnp.abs(_diag_hessian_fd(problem_s, u_ref))
-    h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
-    M = 1.0 / jnp.maximum(h_diag, floor)
-    return jnp.where(jnp.isfinite(M), M, 1.0)
-
-
-def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6):
-    """Full Hessian preconditioner ``M = (|H| + reg·I)^{-1}``.
-
-    Builds an SPD approximation by taking the absolute eigenvalues, so the
-    preconditioner is well-defined even where the Hessian has saddle-point
-    directions. Returns ``(M_matrix, L_chol)`` for SGLD's noise step
-    (``L_chol L_chol^T = M``).
-
-    Falls back to finite-difference Hessian when JAX's analytical 2nd
-    derivatives aren't supported for the forward model, or skips the analytic
-    attempt when a general-path (quadrature) model is present (compile-time
-    prohibitive — see :func:`_prefer_fd_hessian`).
-    """
-    if _prefer_fd_hessian(problem_s):
-        print("  [precond=full_hessian] general-path distribution present; "
+        print("  [hessian] general-path distribution present; "
               "using finite-difference Hessian.")
         H = _full_hessian_fd(problem_s, u_ref)
     else:
         try:
             H = _jax.hessian(problem_s.target_log_prob)(u_ref)
         except NotImplementedError as err:
-            print(f"  [precond=full_hessian] analytical Hessian unavailable "
-                  f"({err}); falling back to finite-difference Hessian.")
+            print(f"  [hessian] analytical Hessian unavailable ({err}); "
+                  f"falling back to finite-difference Hessian.")
             H = _full_hessian_fd(problem_s, u_ref)
     H = jnp.where(jnp.isfinite(H), H, 0.0)
+    return 0.5 * (H + H.T)
+
+
+def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
+                                fallback=1.0, H=None):
+    """Diagonal preconditioner from |H(target_log_prob)(u_ref)|.
+
+    Returns ``M_diag`` of shape (D,) with ``M_diag[i] = 1 / max(|H_ii|, floor)``.
+
+    If ``H`` (a precomputed full Hessian at ``u_ref``) is given, its diagonal
+    is reused instead of recomputing; otherwise the Hessian is obtained via
+    :func:`_full_hessian`. Non-finite entries are replaced with ``fallback``
+    so a single bad coordinate doesn't NaN the entire preconditioner.
+    """
+    if H is None:
+        H = _full_hessian(problem_s, u_ref)
+    h_diag = jnp.abs(jnp.diag(H))
+    h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
+    M = 1.0 / jnp.maximum(h_diag, floor)
+    return jnp.where(jnp.isfinite(M), M, 1.0)
+
+
+def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6, H=None):
+    """Full Hessian preconditioner ``M = (|H| + reg·I)^{-1}``.
+
+    Builds an SPD approximation by taking the absolute eigenvalues, so the
+    preconditioner is well-defined even where the Hessian has saddle-point
+    directions. Returns ``(M, L_chol, L_mass)``:
+
+    - ``M``       : the preconditioner (≈ posterior covariance in u-space);
+    - ``L_chol``  : ``L_chol L_chol^T = M`` — SGLD's noise factor;
+    - ``L_mass``  : ``L_mass L_mass^T = M^{-1}`` — HMC's momentum-draw factor
+      (the mass matrix is ``M^{-1}``).
+
+    If ``H`` (a precomputed full Hessian at ``u_ref``) is given, it is reused
+    instead of recomputing.
+    """
+    if H is None:
+        H = _full_hessian(problem_s, u_ref)
     w, V = jnp.linalg.eigh(0.5 * (H + H.T))
     w_abs = jnp.maximum(jnp.abs(w), 0.0) + reg
     M = (V * (1.0 / w_abs)) @ V.T
-    L = (V * (1.0 / jnp.sqrt(w_abs))) @ V.T
-    return M, L
+    L_chol = (V * (1.0 / jnp.sqrt(w_abs))) @ V.T
+    L_mass = (V * jnp.sqrt(w_abs)) @ V.T
+    return M, L_chol, L_mass
+
+
+# ─── Laplace (delta-method) physical covariance ─────────────────────────────
+
+def _laplace_physical_cov(problem_s, u_ref, hessian_u, *, tol=1e-8,
+                          n_loadings=4):
+    """Delta-method physical-parameter covariance from the MAP Hessian.
+
+    With ``Σ_u = -inv(H)`` the Laplace covariance in u-space and
+    ``J = ∂(physical)/∂u`` (Jacobian of ``resolve_one``), the physical
+    covariance is ``Σ_phys = J Σ_u Jᵀ`` (P×P). It is rank ≤ D — singular along
+    the constraints (tied species, the simplex remainder) — so it has no full
+    inverse, but its diagonal gives valid 1σ physical error bars and any
+    sub-block/linear combo is well-defined.
+
+    Eigenvalues of H are negative at a maximum; any ``> -tol·|λ|max`` flag a
+    non-identified direction (infinite u-space variance). Those are dropped
+    from ``Σ_u`` (so they don't blow the matrix up), counted, and *reported*:
+    each flat eigenvector is projected through J and normalized by the MAP
+    parameter magnitudes, so the report names the physical parameter
+    combination that the data cannot pin down (e.g. a p↔Te trade-off).
+
+    Returns a SimpleNamespace:
+        cov_phys        : (P, P) ndarray
+        labels          : list[str], "<prefix>[t=k]" row/col order
+        sigma_by_prefix : dict[prefix -> (Nt,) 1σ]
+        n_nonidentified : int
+        nonid_loadings  : (n_bad, P) physical relative loadings (unit rows)
+        nonid_descriptions : list[str] human-readable top-loading summaries
+    """
+    u_ref = jnp.asarray(u_ref)
+    d0 = problem_s.resolve_one(u_ref)
+    prefixes = list(d0.keys())
+    nts = {p: int(d0[p].shape[0]) for p in prefixes}
+
+    def flat_resolve(u):
+        d = problem_s.resolve_one(u)
+        return jnp.concatenate([d[p] for p in prefixes])
+
+    J = _jax.jacfwd(flat_resolve)(u_ref)                       # (P, D)
+    w, V = jnp.linalg.eigh(0.5 * (hessian_u + hessian_u.T))    # ascending
+    wmax = jnp.maximum(jnp.max(jnp.abs(w)), 1.0)
+    bad = w > -tol * wmax                                       # non-negative curvature
+    inv_var = jnp.where(bad, 0.0, -1.0 / w)                    # -1/λ for λ < 0
+    Sigma_u = (V * inv_var) @ V.T
+    Sigma_phys = J @ Sigma_u @ J.T
+    Sigma_phys = np.asarray(0.5 * (Sigma_phys + Sigma_phys.T))
+
+    sigma_flat = np.sqrt(np.clip(np.diag(Sigma_phys), 0.0, None))
+    labels, sigma_by_prefix, i = [], {}, 0
+    for p in prefixes:
+        labels += [f"{p}[t={t}]" for t in range(nts[p])]
+        sigma_by_prefix[p] = sigma_flat[i:i + nts[p]]
+        i += nts[p]
+
+    # Non-identified directions, expressed in physical space. J maps a u-space
+    # eigenvector to absolute physical shifts; dividing by the MAP magnitudes
+    # gives comparable *relative* loadings across parameters with wildly
+    # different units (n ~ 1e20 vs ifract ~ 1).
+    bad_np = np.asarray(bad)
+    nonid_loadings = np.zeros((0, len(labels)))
+    nonid_descriptions = []
+    if bad_np.any():
+        x_flat = np.concatenate([np.asarray(d0[p]) for p in prefixes])
+        scale = np.maximum(np.abs(x_flat), 1e-30)
+        J_np, V_np = np.asarray(J), np.asarray(V)
+        rows = []
+        for idx in np.nonzero(bad_np)[0]:
+            d_rel = (J_np @ V_np[:, idx]) / scale
+            nrm = np.linalg.norm(d_rel)
+            d_rel = d_rel / nrm if nrm > 0 else d_rel
+            rows.append(d_rel)
+            order = np.argsort(-np.abs(d_rel))[:n_loadings]
+            terms = [f"{d_rel[j]:+.2f}·{labels[j]}"
+                     for j in order if abs(d_rel[j]) > 0.05]
+            nonid_descriptions.append(" ".join(terms) if terms
+                                      else "(no physical projection — "
+                                           "direction lies in a constrained "
+                                           "null space)")
+        nonid_loadings = np.stack(rows) if rows else nonid_loadings
+
+    return SimpleNamespace(
+        cov_phys=Sigma_phys,
+        labels=labels,
+        sigma_by_prefix=sigma_by_prefix,
+        n_nonidentified=int(bad_np.sum()),
+        nonid_loadings=nonid_loadings,
+        nonid_descriptions=nonid_descriptions,
+    )
+
+
+def _print_nonidentified(lap):
+    if lap.n_nonidentified:
+        print(f"  [laplace] {lap.n_nonidentified} non-identified direction(s) "
+              f"at the MAP (non-negative Hessian curvature); dropped from "
+              f"Σ_phys. Flat physical directions (relative loadings):")
+        for k, desc in enumerate(lap.nonid_descriptions):
+            print(f"    [{k}] {desc}")
 
 
 # ─── SGLD step kernels ──────────────────────────────────────────────────────
@@ -268,45 +385,95 @@ def _sgld_step_full(u, key, eps, M_full, L_chol, target_grad_fn):
     return u_new, logp, g
 
 
-# ─── multi-chain runner (vmapped) ───────────────────────────────────────────
+# ─── HMC / MALA step kernels ────────────────────────────────────────────────
 
-def _make_vmapped_step(target_grad_fn, kind):
-    """Return a jit+vmap step function for the given preconditioner kind."""
-    if kind == "diag":
-        def step(us, keys, eps, M_diag):
-            return vmap(_sgld_step_diag, in_axes=(0, 0, None, None, None))(
-                us, keys, eps, M_diag, target_grad_fn
-            )
-    elif kind == "full":
-        def step(us, keys, eps, M_full, L_chol):
-            return vmap(_sgld_step_full, in_axes=(0, 0, None, None, None, None))(
-                us, keys, eps, M_full, L_chol, target_grad_fn
-            )
-    else:
-        raise ValueError(f"Unknown step kind: {kind!r}")
-    return jit(step)
+def _hmc_step(u, logp, g, key, eps, n_leap, mv_M, draw_p, kinetic,
+              target_grad_fn):
+    """One HMC iteration: momentum draw → leapfrog(n_leap) → Metropolis.
 
+    ``mv_M(p)`` applies the preconditioner (inverse mass) to a momentum,
+    ``draw_p(xi)`` maps a standard normal to p ~ N(0, M⁻¹), and
+    ``kinetic(p) = ½ pᵀ M p``. The carried ``(logp, g)`` at ``u`` avoid a
+    fresh gradient at the start of every trajectory, so an iteration costs
+    exactly ``n_leap`` gradient evaluations.
 
-def _make_pmapped_step(target_grad_fn, kind, devices):
-    """Like :func:`_make_vmapped_step`, but maps the per-chain step across
-    ``devices`` (one chain per device) so the chains advance concurrently.
-
-    Numerically identical to the vmapped version: the per-chain keys are still
-    generated host-side and passed in, so only *where* each chain's step runs
-    changes (device placement does not change the math or the RNG). Requires
-    ``n_chains == len(devices)``; the caller slices ``jax.devices()[:n_chains]``.
-    Non-mapped args (``eps``, the preconditioner) are broadcast to every device.
+    Non-finite trajectory energy ⇒ divergence: the proposal is rejected and
+    flagged. Returns ``(u', logp', g', accept_prob, accepted, divergent)``.
     """
+    key_mom, key_acc = jr.split(key)
+    xi = jr.normal(key_mom, u.shape, dtype=u.dtype)
+    p0 = draw_p(xi)
+    K0 = kinetic(p0)
+
+    def body(i, carry):
+        u_c, p_c, logp_c, g_c = carry
+        u_n = u_c + eps * mv_M(p_c)
+        logp_n, g_n = target_grad_fn(u_n)
+        p_n = p_c + eps * g_n
+        return (u_n, p_n, logp_n, g_n)
+
+    # Standard leapfrog with the half-steps folded in: seed p with +eps/2·g(u0),
+    # run n_leap full (u, p) updates, then remove the surplus eps/2·g(u_L).
+    p_seed = p0 + 0.5 * eps * g
+    u_f, p_f, logp_f, g_f = lax.fori_loop(
+        0, n_leap, body, (u, p_seed, logp, g))
+    p_f = p_f - 0.5 * eps * g_f
+    K_f = kinetic(p_f)
+
+    log_ratio = (logp_f - K_f) - (logp - K0)
+    divergent = ~jnp.isfinite(log_ratio)
+    log_ratio = jnp.where(divergent, -jnp.inf, log_ratio)
+    accept_prob = jnp.minimum(1.0, jnp.exp(log_ratio))
+    accepted = jnp.log(jr.uniform(key_acc, (), dtype=u.dtype)) < log_ratio
+    u_out = jnp.where(accepted, u_f, u)
+    logp_out = jnp.where(accepted, logp_f, logp)
+    g_out = jnp.where(accepted, g_f, g)
+    return u_out, logp_out, g_out, accept_prob, accepted, divergent
+
+
+def _make_hmc_one_step(problem_s, kind, precond_obj):
+    """Bind the preconditioner into a per-chain HMC step function."""
+    tg = problem_s.target_log_prob_and_grad
     if kind == "diag":
-        def step(u, key, eps, M_diag):
-            return _sgld_step_diag(u, key, eps, M_diag, target_grad_fn)
-        return pmap(step, in_axes=(0, 0, None, None), devices=devices)
-    elif kind == "full":
-        def step(u, key, eps, M_full, L_chol):
-            return _sgld_step_full(u, key, eps, M_full, L_chol, target_grad_fn)
-        return pmap(step, in_axes=(0, 0, None, None, None), devices=devices)
+        M_diag = precond_obj
+        inv_sqrt_M = 1.0 / jnp.sqrt(M_diag)
+        mv_M = lambda p: M_diag * p
+        draw_p = lambda xi: inv_sqrt_M * xi
+        kinetic = lambda p: 0.5 * jnp.sum(M_diag * p * p)
     else:
-        raise ValueError(f"Unknown step kind: {kind!r}")
+        M_full, _L_chol, L_mass = precond_obj
+        mv_M = lambda p: M_full @ p
+        draw_p = lambda xi: L_mass @ xi
+        kinetic = lambda p: 0.5 * jnp.dot(p, M_full @ p)
+
+    def one_step(u, logp, g, key, eps, n_leap):
+        return _hmc_step(u, logp, g, key, eps, n_leap,
+                         mv_M, draw_p, kinetic, tg)
+    return one_step
+
+
+# ─── dual-averaging step-size adaptation (Hoffman & Gelman 2014) ────────────
+
+_DA_GAMMA, _DA_T0, _DA_KAPPA = 0.05, 10.0, 0.75
+_LOG_EPS_MIN, _LOG_EPS_MAX = np.log(1e-12), np.log(1e3)
+
+
+def _da_init(eps0):
+    """(t, H_bar, log_eps, log_eps_bar) — log_eps_bar is the final answer."""
+    log_e = jnp.log(eps0)
+    return (jnp.zeros(()), jnp.zeros(()), log_e, log_e)
+
+
+def _da_update(state, alpha_mean, mu, target):
+    t, H_bar, log_eps, log_eps_bar = state
+    t = t + 1.0
+    H_bar = (1.0 - 1.0 / (t + _DA_T0)) * H_bar \
+        + (target - alpha_mean) / (t + _DA_T0)
+    log_eps = jnp.clip(mu - jnp.sqrt(t) / _DA_GAMMA * H_bar,
+                       _LOG_EPS_MIN, _LOG_EPS_MAX)
+    eta = t ** (-_DA_KAPPA)
+    log_eps_bar = eta * log_eps + (1.0 - eta) * log_eps_bar
+    return (t, H_bar, log_eps, log_eps_bar)
 
 
 def _drift_noise_ratio(g_arr, eps, M_diag_or_full, kind):
@@ -338,29 +505,59 @@ def _drift_noise_ratio(g_arr, eps, M_diag_or_full, kind):
 
 # ─── diagnostics ────────────────────────────────────────────────────────────
 
+def _rank_normalize(x):
+    """Rank-normalize pooled draws per coordinate (Vehtari et al. 2021).
+
+    x : (m, n, *) — average-rank over the pooled m·n draws, mapped through the
+    normal quantile function with the (r - 3/8)/(S + 1/4) offset.
+    """
+    from scipy.special import ndtri
+    m, n = x.shape[0], x.shape[1]
+    flat = x.reshape(m * n, *x.shape[2:])
+    # argsort-of-argsort ranks (0-based); ties are broken by order, which is
+    # immaterial for continuous MCMC draws.
+    order = np.argsort(flat, axis=0)
+    ranks = np.empty_like(order)
+    np.put_along_axis(ranks, order,
+                      np.arange(m * n).reshape(-1, *([1] * (flat.ndim - 1)))
+                      * np.ones_like(order), axis=0)
+    z = ndtri((ranks + 1 - 0.375) / (m * n + 0.25))
+    return z.reshape(m, n, *x.shape[2:])
+
+
+def _rhat_basic(x):
+    """Plain Gelman-Rubin R-hat on (m, n, *) chains."""
+    m, n = x.shape[0], x.shape[1]
+    chain_means = x.mean(axis=1)                                    # (m, *)
+    B = n * np.var(chain_means, axis=0, ddof=1)
+    W = np.mean(np.var(x, axis=1, ddof=1), axis=0)
+    var_hat = ((n - 1) / n) * W + B / n
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.sqrt(var_hat / np.maximum(W, 1e-300))
+
+
 def _rhat(samples):
-    """Rank-normalized Gelman-Rubin R-hat.
+    """Split-chain, rank-normalized R-hat (Vehtari et al. 2021).
 
     samples : array of shape (n_chains, n_samples, *)
-    Returns array of shape (*) — R-hat per coordinate. Coordinates whose
-    samples are effectively constant (relative std < 1e-10) return NaN.
+    Each chain is split in half (catching within-chain drift that plain R-hat
+    misses) and the pooled draws are rank-normalized before the classic
+    formula, making the diagnostic robust to heavy tails. Returns the max of
+    the bulk (rank-normalized) and naive R-hat per coordinate. Coordinates
+    whose samples are effectively constant (relative std < 1e-10) return NaN.
     """
     x = np.asarray(samples)
     nc, ns = x.shape[0], x.shape[1]
-    if nc < 2 or ns < 2:
+    if nc < 2 or ns < 4:
         return np.full(x.shape[2:], np.nan)
-    chain_means = x.mean(axis=1)                                    # (nc, *)
-    grand_mean = chain_means.mean(axis=0)                            # (*)
-    B = ns * np.var(chain_means, axis=0, ddof=1)
-    W = np.mean(np.var(x, axis=1, ddof=1), axis=0)
-    var_hat = ((ns - 1) / ns) * W + B / ns
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rhat = np.sqrt(var_hat / np.maximum(W, 1e-300))
+    half = ns // 2
+    xs = np.concatenate([x[:, :half], x[:, half:2 * half]], axis=0)  # (2nc, half, *)
+    rhat = np.maximum(_rhat_basic(_rank_normalize(xs)), _rhat_basic(xs))
     # Mask coordinates whose samples are effectively constant.
+    grand_mean = x.reshape(-1, *x.shape[2:]).mean(axis=0)
     overall_std = x.reshape(-1, *x.shape[2:]).std(axis=0)
     scale = np.maximum(np.abs(grand_mean), 1.0)
-    rhat = np.where(overall_std > 1e-10 * scale, rhat, np.nan)
-    return rhat
+    return np.where(overall_std > 1e-10 * scale, rhat, np.nan)
 
 
 def _ess(samples):
@@ -410,17 +607,263 @@ def _ess(samples):
     return ess
 
 
-# ─── top-level driver ──────────────────────────────────────────────────────
+# ─── chunked scan runners ───────────────────────────────────────────────────
+#
+# All kernels advance through jitted `lax.scan` chunks (default ~100
+# iterations per chunk) instead of one jitted call per iteration: the
+# adaptation math lives on-device inside the scan, so the only host↔device
+# traffic is one carry + output transfer per chunk (the old loop paid a
+# Python dispatch and a host sync every single step). The outer Python loop
+# over chunks drives tqdm and bounds compile time. With >1 device and one
+# chain per device the same scan bodies run inside `pmap` (scan-inside-pmap),
+# with cross-chain reductions via `lax.pmean`/`lax.all_gather`; shared state
+# (step size, adaptation) is computed identically on every device.
 
-def run_sgld_posterior(problem, u_map, *,
+def _split_chunks(total, chunk_size):
+    sizes = [chunk_size] * (total // chunk_size)
+    if total % chunk_size:
+        sizes.append(total % chunk_size)
+    return sizes
+
+
+def _chunk_keys(key, size, n_chains):
+    """Host-side per-iteration per-chain keys for one chunk.
+
+    Returns (key', keys) with keys shaped (size, n_chains, 2).
+    """
+    key, sub = jr.split(key)
+    keys = jr.split(sub, size * n_chains).reshape(size, n_chains, 2)
+    return key, keys
+
+
+def _chunk_nleaps(key, size, n_leapfrog):
+    """Per-iteration trajectory lengths, shared across chains (lockstep)."""
+    key, sub = jr.split(key)
+    if n_leapfrog <= 1:
+        return key, jnp.ones(size, dtype=jnp.int32)
+    return key, jr.randint(sub, (size,), 1, n_leapfrog + 1)
+
+
+def _make_hmc_chunk_fns(problem_s, kind, precond_obj, n_chains, mu, target,
+                        use_pmap, devices):
+    """Build jitted (burn_chunk, samp_chunk) for the HMC/MALA kernel.
+
+    burn_chunk(us, logps, gs, da, keys, n_leaps)
+        -> us, logps, gs, da, (eps_hist, alpha_hist, div_hist)
+    samp_chunk(us, logps, gs, eps, keys, n_leaps)
+        -> us, logps, gs, (u_hist, logp_hist, acc_hist, div_hist)
+    """
+    one_step = _make_hmc_one_step(problem_s, kind, precond_obj)
+
+    if not use_pmap:
+        step_c = vmap(one_step, in_axes=(0, 0, 0, 0, None, None))
+
+        def burn_chunk(us, logps, gs, da, keys, n_leaps):
+            def body(carry, xs):
+                us, logps, gs, da = carry
+                k, nl = xs
+                eps = jnp.exp(da[2])
+                us, logps, gs, aprob, acc, div = step_c(us, logps, gs, k, eps, nl)
+                alpha = jnp.mean(aprob)
+                da = _da_update(da, alpha, mu, target)
+                return (us, logps, gs, da), (eps, alpha, jnp.sum(div))
+            (us, logps, gs, da), hist = lax.scan(
+                body, (us, logps, gs, da), (keys, n_leaps))
+            return us, logps, gs, da, hist
+
+        def samp_chunk(us, logps, gs, eps, keys, n_leaps):
+            def body(carry, xs):
+                us, logps, gs = carry
+                k, nl = xs
+                us, logps, gs, aprob, acc, div = step_c(us, logps, gs, k, eps, nl)
+                return (us, logps, gs), (us, logps, acc, div)
+            (us, logps, gs), hist = lax.scan(
+                body, (us, logps, gs), (keys, n_leaps))
+            return us, logps, gs, hist
+
+        return jit(burn_chunk), jit(samp_chunk)
+
+    # pmap backend: one chain per device, scan inside pmap. Shared quantities
+    # (eps, dual-averaging state) are derived from pmean'd acceptance, so every
+    # device computes identical copies; the host reads device 0.
+    def dev_burn(u, logp, g, da, keys_dev, n_leaps):
+        def body(carry, xs):
+            u, logp, g, da = carry
+            k, nl = xs
+            eps = jnp.exp(da[2])
+            u, logp, g, aprob, acc, div = one_step(u, logp, g, k, eps, nl)
+            alpha = lax.pmean(aprob, axis_name="chains")
+            da = _da_update(da, alpha, mu, target)
+            div_tot = lax.psum(div.astype(jnp.int32), axis_name="chains")
+            return (u, logp, g, da), (eps, alpha, div_tot)
+        (u, logp, g, da), hist = lax.scan(
+            body, (u, logp, g, da), (keys_dev, n_leaps))
+        return u, logp, g, da, hist
+
+    def dev_samp(u, logp, g, eps, keys_dev, n_leaps):
+        def body(carry, xs):
+            u, logp, g = carry
+            k, nl = xs
+            u, logp, g, aprob, acc, div = one_step(u, logp, g, k, eps, nl)
+            return (u, logp, g), (u, logp, acc, div)
+        (u, logp, g), hist = lax.scan(body, (u, logp, g), (keys_dev, n_leaps))
+        return u, logp, g, hist
+
+    burn_p = pmap(dev_burn, axis_name="chains",
+                  in_axes=(0, 0, 0, None, 1, None), devices=devices)
+    samp_p = pmap(dev_samp, axis_name="chains",
+                  in_axes=(0, 0, 0, None, 1, None), devices=devices)
+
+    def burn_chunk(us, logps, gs, da, keys, n_leaps):
+        us, logps, gs, da_r, hist = burn_p(us, logps, gs, da, keys, n_leaps)
+        # da_r / eps_hist / alpha_hist replicated across devices; take dev 0.
+        da = tuple(v[0] for v in da_r)
+        eps_h, alpha_h, div_h = hist
+        return us, logps, gs, da, (eps_h[0], alpha_h[0], div_h[0])
+
+    def samp_chunk(us, logps, gs, eps, keys, n_leaps):
+        us, logps, gs, hist = samp_p(us, logps, gs, eps, keys, n_leaps)
+        u_h, logp_h, acc_h, div_h = hist          # (nc, size, ...) — chain-major
+        return us, logps, gs, (jnp.moveaxis(u_h, 0, 1),
+                               jnp.moveaxis(logp_h, 0, 1),
+                               jnp.moveaxis(acc_h, 0, 1),
+                               jnp.moveaxis(div_h, 0, 1))
+
+    return burn_chunk, samp_chunk
+
+
+def _make_sgld_chunk_fns(problem_s, kind, precond_obj, n_chains, burn_in,
+                         adapt_step, adapt_target, rmsprop, use_pmap, devices):
+    """Build jitted (burn_chunk, samp_chunk) for the legacy SGLD kernel.
+
+    burn_chunk(us, eps, rms, it0, keys) -> us, eps, rms, (eps_hist,)
+    samp_chunk(us, eps, M_diag_or_none, keys) -> us, (u_hist, logp_hist)
+
+    The Robbins-Monro drift/noise adaptation and (optionally) the RMSProp
+    preconditioner EMA run on-device inside the scan; `it0` carries the global
+    burn-in iteration index for the decaying learning rate.
+    """
+    tg = problem_s.target_log_prob_and_grad
+    rmsprop_beta, rmsprop_eps = 0.95, 1e-6
+    tgt = max(float(adapt_target), 1e-3)
+
+    if kind == "diag":
+        def one_step(u, key, eps, M_diag):
+            return _sgld_step_diag(u, key, eps, M_diag, tg)
+    else:
+        M_full, L_chol, _L_mass = precond_obj
+
+        def one_step(u, key, eps, _M_unused):
+            return _sgld_step_full(u, key, eps, M_full, L_chol, tg)
+
+    if not use_pmap:
+        step_c = vmap(one_step, in_axes=(0, 0, None, None))
+
+        def _median_ratio(gs, eps, M_diag):
+            M_r = M_diag if kind == "diag" else M_full
+            return _drift_noise_ratio(gs, eps, M_r, kind)
+    else:
+        step_c = None  # per-device one_step used directly below
+
+    M_static = precond_obj if kind == "diag" else jnp.zeros(())
+
+    if not use_pmap:
+        def burn_chunk(us, eps, rms, it0, keys):
+            def body(carry, k):
+                us, eps, rms, it = carry
+                M_diag = (1.0 / (jnp.sqrt(rms) + rmsprop_eps)) if rmsprop \
+                    else M_static
+                us, logps, gs = step_c(us, k, eps, M_diag)
+                if rmsprop:
+                    g_sq = jnp.mean(gs ** 2, axis=0)
+                    rms = rmsprop_beta * rms + (1 - rmsprop_beta) * g_sq
+                if adapt_step:
+                    r_t = _median_ratio(gs, eps, M_diag)
+                    eta = 0.05 / (1.0 + 10.0 * (it / max(1, burn_in)))
+                    eps = eps * jnp.exp(eta * (adapt_target - r_t) / tgt)
+                    eps = jnp.clip(eps, 1e-12, 1e3)
+                return (us, eps, rms, it + 1.0), eps
+            (us, eps, rms, it0), eps_hist = lax.scan(
+                body, (us, eps, rms, it0), keys)
+            return us, eps, rms, it0, eps_hist
+
+        def samp_chunk(us, eps, M_diag, keys):
+            def body(carry, k):
+                us = carry
+                us, logps, gs = step_c(us, k, eps, M_diag)
+                return us, (us, logps)
+            us, hist = lax.scan(body, us, keys)
+            return us, hist
+
+        return jit(burn_chunk), jit(samp_chunk)
+
+    # pmap backend (one chain per device). The median drift/noise ratio needs
+    # every chain's gradients: all_gather them so each device computes the
+    # identical global median and hence identical eps updates.
+    def dev_burn(u, eps, rms, it0, keys_dev):
+        def body(carry, k):
+            u, eps, rms, it = carry
+            M_diag = (1.0 / (jnp.sqrt(rms) + rmsprop_eps)) if rmsprop \
+                else M_static
+            u, logp, g = one_step(u, k, eps, M_diag)
+            if rmsprop:
+                g_sq = lax.pmean(g ** 2, axis_name="chains")
+                rms = rmsprop_beta * rms + (1 - rmsprop_beta) * g_sq
+            if adapt_step:
+                gs = lax.all_gather(g, axis_name="chains")   # (nc, D)
+                M_r = M_diag if kind == "diag" else M_full
+                r_t = _drift_noise_ratio(gs, eps, M_r, kind)
+                eta = 0.05 / (1.0 + 10.0 * (it / max(1, burn_in)))
+                eps = eps * jnp.exp(eta * (adapt_target - r_t) / tgt)
+                eps = jnp.clip(eps, 1e-12, 1e3)
+            return (u, eps, rms, it + 1.0), eps
+        (u, eps, rms, it0), eps_hist = lax.scan(
+            body, (u, eps, rms, it0), keys_dev)
+        return u, eps, rms, it0, eps_hist
+
+    def dev_samp(u, eps, M_diag, keys_dev):
+        def body(carry, k):
+            u = carry
+            u, logp, g = one_step(u, k, eps, M_diag)
+            return u, (u, logp)
+        u, hist = lax.scan(body, u, keys_dev)
+        return u, hist
+
+    burn_p = pmap(dev_burn, axis_name="chains",
+                  in_axes=(0, None, None, None, 1), devices=devices)
+    samp_p = pmap(dev_samp, axis_name="chains",
+                  in_axes=(0, None, None, 1), devices=devices)
+
+    def burn_chunk(us, eps, rms, it0, keys):
+        us, eps_r, rms_r, it_r, eps_hist = burn_p(us, eps, rms, it0, keys)
+        return us, eps_r[0], rms_r[0], it_r[0], eps_hist[0]
+
+    def samp_chunk(us, eps, M_diag, keys):
+        us, hist = samp_p(us, eps, M_diag, keys)
+        u_h, logp_h = hist                        # (nc, size, ...)
+        return us, (jnp.moveaxis(u_h, 0, 1), jnp.moveaxis(logp_h, 0, 1))
+
+    return burn_chunk, samp_chunk
+
+
+# ─── top-level drivers ──────────────────────────────────────────────────────
+
+_KERNELS = ("hmc", "mala", "sgld")
+
+
+def run_mcmc_posterior(problem, u_map, *,
+                       kernel="hmc",
                        temperature=None,
                        n_samples=1000, n_chains=4,
                        burn_in=None, thin=1, perturb_scale=1.0,
-                       step_size=0.1, adapt_step=True, adapt_target=0.3,
+                       step_size=None, adapt_step=True, adapt_target=None,
+                       n_leapfrog=16,
                        precond="diag_hessian",
                        seed=0, progress=False,
-                       polish_map=False, polish_max_iter=200):
-    """Run multi-chain preconditioned SGLD.
+                       polish_map=False, polish_max_iter=200,
+                       chunk_size=100,
+                       laplace_tol=1e-8):
+    """Run multi-chain MCMC (HMC, MALA, or legacy SGLD).
 
     Parameters
     ----------
@@ -429,6 +872,13 @@ def run_sgld_posterior(problem, u_map, *,
     u_map : array (D,)
         LBFGS MAP in unconstrained space (e.g. from running ``run_fit_grad``
         and re-encoding ``result.x`` via ``problem.to_internal_np``).
+    kernel : {"hmc", "mala", "sgld"}
+        - ``hmc`` (default): Metropolis-corrected leapfrog trajectories.
+          Costs ~``n_leapfrog/2`` gradients per iteration but decorrelates
+          far faster per iteration, and its error bars carry no step-size
+          bias. Best for correlated/degenerate posteriors.
+        - ``mala``: HMC with one leapfrog step. Cheapest exact kernel.
+        - ``sgld``: legacy unadjusted Langevin (biased at finite step size).
     temperature : float, ``"auto"``, ``"unit"``, or None
     n_samples : int
         Number of post-burn-in, post-thin samples per chain.
@@ -438,39 +888,62 @@ def run_sgld_posterior(problem, u_map, *,
         Burn-in iterations per chain. Default = n_samples.
     thin : int
         Keep every ``thin``-th sample after burn-in.
-    step_size : float
-        Initial SGLD step size in u-space. Adapted during burn-in if
+    step_size : float or None
+        Initial step size in u-space. Defaults: 0.5 for hmc/mala (the
+        preconditioner makes the posterior ≈ unit-scale, where leapfrog is
+        stable up to eps ≈ 2), 0.1 for sgld. Adapted during burn-in when
         ``adapt_step`` is True.
     adapt_step : bool
-        Robbins-Monro adaptation of step_size during burn-in only.
-    adapt_target : float
-        Target ratio of drift to noise during burn-in. 0.5–1 is the useful
-        range; default 0.7 balances bias (small) vs. mixing (large).
+        hmc/mala: dual averaging on the acceptance rate (Hoffman & Gelman
+        2014). sgld: legacy Robbins-Monro on the drift/noise ratio.
+    adapt_target : float or None
+        Target acceptance rate (hmc: 0.8, mala: 0.574) or drift/noise ratio
+        (sgld: 0.3). None picks the kernel default.
+    n_leapfrog : int
+        Max leapfrog steps per HMC iteration; the actual length is drawn
+        uniformly in [1, n_leapfrog] each iteration (jitter avoids
+        resonances). Ignored for mala (=1) and sgld.
     precond : {"diag_hessian", "full_hessian", "rmsprop", "identity"}
-        Mass-matrix preconditioner.
-        - ``diag_hessian`` (recommended default): inverse |diag(H)| at the
-          init point. Captures per-coordinate curvature. Cheap (one
-          Hessian-diagonal evaluation).
-        - ``full_hessian``: inverse |H| via eigendecomposition. Captures
-          cross-parameter correlations from Tikhonov regularization. Good
-          for problems with strong inter-time correlations; O(D^3) once.
-        - ``rmsprop``: running EMA of grad^2 across burn-in, frozen at the
-          end. No Hessian needed but mixes poorly when parameter scales
-          differ widely (the EMA on raw u-space gradients can't compensate
-          for the bijector scale). Useful as a Hessian-free fallback.
-        - ``identity``: no preconditioning. Only useful for diagnostics or
-          when the problem is already nicely scaled.
+        Mass-matrix preconditioner, built once at the init point.
+        - ``diag_hessian`` (recommended default): inverse |diag(H)|.
+        - ``full_hessian``: inverse |H| via eigendecomposition; captures
+          cross-parameter correlations (useful when parameters trade off,
+          e.g. shape↔temperature degeneracies). O(D^3) once.
+        - ``rmsprop`` (sgld only): running EMA of grad², frozen at burn-in end.
+        - ``identity``: no preconditioning (diagnostics only).
     polish_map : bool
         If True, run a brief LBFGS on the Jacobian-corrected target to
         recenter chains on the posterior mode. Only meaningful when the
         Jacobian shift is non-negligible (i.e. ``temperature ≈ 1``).
+    chunk_size : int
+        Iterations per jitted `lax.scan` chunk (progress-bar granularity and
+        compile-size bound; does not change the math).
+    laplace_tol : float
+        Relative eigenvalue threshold flagging non-identified directions in
+        the Laplace covariance.
 
     Returns
     -------
-    SimpleNamespace (see module docstring for exhaustive field list).
+    SimpleNamespace — samples, summary, diagnostics, Laplace covariance and
+    metadata (see the fields set at the end of this function).
     """
+    if kernel not in _KERNELS:
+        raise ValueError(f"Unknown kernel: {kernel!r}. Choose from {_KERNELS}.")
     if burn_in is None:
         burn_in = n_samples
+    if adapt_target is None:
+        adapt_target = {"hmc": 0.8, "mala": 0.574, "sgld": 0.3}[kernel]
+    if step_size is None:
+        step_size = 0.1 if kernel == "sgld" else 0.5
+    if kernel == "mala":
+        n_leapfrog = 1
+    n_leapfrog = max(1, int(n_leapfrog))
+    if kernel in ("hmc", "mala") and precond == "rmsprop":
+        raise ValueError(
+            "precond='rmsprop' is only supported with kernel='sgld' "
+            "(the Metropolis kernels need a fixed mass matrix). "
+            "Use 'diag_hessian' or 'full_hessian'."
+        )
 
     problem_s = build_sampling_problem(problem, temperature=temperature)
     u_map = jnp.asarray(u_map, dtype=jnp.float64)
@@ -482,42 +955,49 @@ def run_sgld_posterior(problem, u_map, *,
     else:
         u_chain_init = u_map
 
-    # Preconditioner setup at u_chain_init.
+    # ─── Hessian (once) → preconditioner + Laplace covariance ────────────
     # ``rmsprop`` is adaptive: M_diag is updated during burn-in from an EMA
     # of (mean across chains of) grad^2, then frozen for sampling so the
     # sampler targets a fixed invariant distribution.
     kind = "diag" if precond in ("diag_hessian", "identity", "rmsprop") else "full"
-    rmsprop_state = None
+    hessian_u = None
+    if precond in ("diag_hessian", "full_hessian"):
+        hessian_u = _full_hessian(problem_s, u_map)
+
+    rmsprop = precond == "rmsprop"
     if precond == "diag_hessian":
-        M_diag = _build_diag_hessian_precond(problem_s, u_chain_init)
+        M_diag = _build_diag_hessian_precond(problem_s, u_chain_init,
+                                             H=(hessian_u if not polish_map
+                                                else None))
         precond_obj = M_diag
     elif precond == "identity":
         M_diag = jnp.ones(D, dtype=jnp.float64)
         precond_obj = M_diag
     elif precond == "rmsprop":
         M_diag = jnp.ones(D, dtype=jnp.float64)
-        rmsprop_state = jnp.ones(D, dtype=jnp.float64)  # v_EMA initial
         precond_obj = M_diag
     elif precond == "full_hessian":
-        M_full, L_chol = _build_full_hessian_precond(problem_s, u_chain_init)
-        precond_obj = (M_full, L_chol)
+        precond_obj = _build_full_hessian_precond(
+            problem_s, u_chain_init,
+            H=(hessian_u if not polish_map else None))
     else:
         raise ValueError(f"Unknown precond: {precond!r}. Choose "
                          "'diag_hessian', 'full_hessian', 'rmsprop', or 'identity'.")
 
-    # Build the per-chain step function. When the host exposes >1 device with at
-    # least one device per chain (and parallelism isn't disabled), map the chains
-    # across devices with pmap so they advance concurrently; otherwise vmap them
-    # on a single device. Numerically identical either way (the sampler's
-    # objective is built unsharded, so each chain runs a plain forward+grad).
+    # Laplace physical-parameter covariance at the MAP (delta method through
+    # the constraint map). Σ_phys is singular along the constraints, but its
+    # diagonal gives valid 1σ physical error bars (exported as laplace/sigma),
+    # and its flat directions diagnose degeneracies.
+    lap = None
+    if hessian_u is not None:
+        lap = _laplace_physical_cov(problem_s, u_map, hessian_u,
+                                    tol=laplace_tol)
+        _print_nonidentified(lap)
+
+    # ─── backends: chains across devices (pmap) or one device (vmap) ─────
     n_dev = _jax.device_count()
     use_chain_pmap = (not serial_requested()) and n_dev > 1 and n_chains <= n_dev
-    if use_chain_pmap:
-        chain_devices = _jax.devices()[:n_chains]
-        step_fn = _make_pmapped_step(
-            problem_s.target_log_prob_and_grad, kind, chain_devices)
-    else:
-        step_fn = _make_vmapped_step(problem_s.target_log_prob_and_grad, kind)
+    chain_devices = _jax.devices()[:n_chains] if use_chain_pmap else None
 
     # Initialize chain states: perturb in sigma_u units (sqrt of diag precond)
     # so perturb_scale=1.0 means "start chains roughly 1 posterior std apart
@@ -527,84 +1007,142 @@ def run_sgld_posterior(problem, u_map, *,
     if kind == "diag":
         sigma_u = jnp.sqrt(precond_obj)
     else:
-        # full Hessian: use sqrt(diag(M_full)) as per-coord std
         sigma_u = jnp.sqrt(jnp.diag(precond_obj[0]))
     perturb = perturb_scale * sigma_u[None, :] * jr.normal(
         sk, (n_chains, D), dtype=jnp.float64
     )
     us = u_chain_init[None, :] + perturb                              # (n_chains, D)
 
-    eps = float(step_size)
-    eps_history = np.zeros(burn_in, dtype=np.float64)
-
     bar = None
     if progress:
         from tqdm.auto import tqdm
-        bar = tqdm(desc="SGLD burn-in", total=burn_in + n_samples * thin,
-                   unit="iter")
+        bar = tqdm(desc=f"{kernel.upper()} burn-in",
+                   total=burn_in + n_samples * thin, unit="iter")
 
-    # ─── burn-in (with optional adaptation) ──────────────────────────────
     t0 = time.time()
-    rmsprop_beta = 0.95
-    rmsprop_eps = 1e-6
-    for it in range(burn_in):
-        key, *sub = jr.split(key, n_chains + 1)
-        chain_keys = jnp.stack(sub)
-        if kind == "diag":
-            us, logps, gs = step_fn(us, chain_keys, eps, precond_obj)
-            M_for_ratio = precond_obj
+    eps_history = np.zeros(burn_in, dtype=np.float64)
+    n_divergent_burn = 0
+
+    if kernel in ("hmc", "mala"):
+        mu_da = float(np.log(10.0 * step_size))
+        burn_chunk, samp_chunk = _make_hmc_chunk_fns(
+            problem_s, kind, precond_obj, n_chains, mu_da, adapt_target,
+            use_chain_pmap, chain_devices)
+
+        # Initial (logp, grad) at the chain states — carried thereafter, so
+        # each HMC iteration costs exactly n_leap gradient evaluations.
+        init_lp = jit(vmap(problem_s.target_log_prob_and_grad))
+        logps, gs = init_lp(us)
+
+        if not adapt_step:
+            # Freeze eps by pinning the DA state to log(step_size).
+            da = (jnp.zeros(()), jnp.zeros(()),
+                  jnp.log(jnp.asarray(step_size)), jnp.log(jnp.asarray(step_size)))
         else:
-            us, logps, gs = step_fn(us, chain_keys, eps, precond_obj[0], precond_obj[1])
-            M_for_ratio = precond_obj[0]
+            da = _da_init(step_size)
 
-        if rmsprop_state is not None:
-            # Update RMSProp EMA from this step's gradients, freshen M_diag.
-            # Mean across chains keeps the preconditioner shared (and the
-            # sampler well-defined). M_diag freezes when burn-in ends.
-            g_sq = jnp.mean(gs ** 2, axis=0)
-            rmsprop_state = rmsprop_beta * rmsprop_state + (1 - rmsprop_beta) * g_sq
-            precond_obj = 1.0 / (jnp.sqrt(rmsprop_state) + rmsprop_eps)
+        # ── burn-in ──
+        off = 0
+        for size in _split_chunks(burn_in, chunk_size):
+            key, keys = _chunk_keys(key, size, n_chains)
+            key, nls = _chunk_nleaps(key, size, n_leapfrog)
+            if adapt_step:
+                us, logps, gs, da, (eps_h, alpha_h, div_h) = burn_chunk(
+                    us, logps, gs, da, keys, nls)
+            else:
+                eps_fix = jnp.asarray(step_size)
+                us, logps, gs, (u_h, lp_h, acc_h, div_h) = samp_chunk(
+                    us, logps, gs, eps_fix, keys, nls)
+                eps_h = jnp.full(size, step_size)
+                alpha_h = jnp.mean(acc_h, axis=1)
+            eps_history[off:off + size] = np.asarray(eps_h)
+            n_divergent_burn += int(np.sum(np.asarray(div_h)))
+            off += size
+            if bar is not None:
+                bar.update(size)
+                bar.set_postfix({"step_size": f"{float(eps_h[-1]):.2e}",
+                                 "accept": f"{float(alpha_h[-1]):.2f}"})
 
-        if adapt_step:
-            r_t = _drift_noise_ratio(gs, eps, M_for_ratio, kind)
-            r_t_f = float(r_t)
-            # Robbins-Monro: r = drift/noise grows with sqrt(eps), so to push
-            # r toward target we move eps in the direction of (target - r).
-            # η decays through burn-in so eps settles.
-            eta = 0.05 / (1.0 + 10.0 * (it / max(1, burn_in)))
-            eps = eps * float(jnp.exp(eta * (adapt_target - r_t_f) / max(adapt_target, 1e-3)))
-            eps = float(np.clip(eps, 1e-12, 1e3))
-
-        eps_history[it] = eps
-        if bar is not None:
-            bar.update(1)
-            bar.set_postfix({"step_size": f"{eps:.2e}"})
-
-    if bar is not None:
-        bar.set_description("SGLD sampling")
-
-    # ─── sampling (fixed step size) ──────────────────────────────────────
-    n_iter_sample = n_samples * thin
-    # Pre-allocate storage of u-samples for the kept iterations.
-    u_samples = np.empty((n_chains, n_samples, D), dtype=np.float64)
-    log_probs = np.empty((n_chains, n_samples), dtype=np.float64)
-
-    keep_idx = 0
-    for it in range(n_iter_sample):
-        key, *sub = jr.split(key, n_chains + 1)
-        chain_keys = jnp.stack(sub)
-        if kind == "diag":
-            us, logps, _ = step_fn(us, chain_keys, eps, precond_obj)
-        else:
-            us, logps, _ = step_fn(us, chain_keys, eps, precond_obj[0], precond_obj[1])
-
-        if (it + 1) % thin == 0:
-            u_samples[:, keep_idx] = np.asarray(us)
-            log_probs[:, keep_idx] = np.asarray(logps)
-            keep_idx += 1
+        eps = float(np.exp(np.asarray(da[3]))) if adapt_step else float(step_size)
 
         if bar is not None:
-            bar.update(1)
+            bar.set_description(f"{kernel.upper()} sampling")
+
+        # ── sampling (fixed step size) ──
+        n_iter_sample = n_samples * thin
+        u_samples = np.empty((n_chains, n_samples, D), dtype=np.float64)
+        log_probs = np.empty((n_chains, n_samples), dtype=np.float64)
+        acc_all = []
+        n_divergent_samp = 0
+        keep_idx, it_global = 0, 0
+        eps_j = jnp.asarray(eps)
+        for size in _split_chunks(n_iter_sample, chunk_size):
+            key, keys = _chunk_keys(key, size, n_chains)
+            key, nls = _chunk_nleaps(key, size, n_leapfrog)
+            us, logps, gs, (u_h, lp_h, acc_h, div_h) = samp_chunk(
+                us, logps, gs, eps_j, keys, nls)
+            u_h, lp_h = np.asarray(u_h), np.asarray(lp_h)      # (size, nc, ...)
+            acc_all.append(np.asarray(acc_h))
+            n_divergent_samp += int(np.sum(np.asarray(div_h)))
+            # keep iterations where (global_it + 1) % thin == 0
+            its = np.arange(it_global, it_global + size)
+            sel = np.nonzero((its + 1) % thin == 0)[0]
+            nk = len(sel)
+            u_samples[:, keep_idx:keep_idx + nk] = np.moveaxis(u_h[sel], 0, 1)
+            log_probs[:, keep_idx:keep_idx + nk] = np.moveaxis(lp_h[sel], 0, 1)
+            keep_idx += nk
+            it_global += size
+            if bar is not None:
+                bar.update(size)
+        accept_rate = (np.concatenate(acc_all, axis=0).mean(axis=0)
+                       if acc_all else np.full(n_chains, np.nan))
+        n_divergent = n_divergent_burn + n_divergent_samp
+
+    else:  # ── legacy SGLD ──
+        burn_chunk, samp_chunk = _make_sgld_chunk_fns(
+            problem_s, kind, precond_obj, n_chains, burn_in,
+            adapt_step, adapt_target, rmsprop, use_chain_pmap, chain_devices)
+
+        eps_j = jnp.asarray(float(step_size))
+        rms = jnp.ones(D, dtype=jnp.float64)
+        it0 = jnp.zeros(())
+        off = 0
+        for size in _split_chunks(burn_in, chunk_size):
+            key, keys = _chunk_keys(key, size, n_chains)
+            us, eps_j, rms, it0, eps_h = burn_chunk(us, eps_j, rms, it0, keys)
+            eps_history[off:off + size] = np.asarray(eps_h)
+            off += size
+            if bar is not None:
+                bar.update(size)
+                bar.set_postfix({"step_size": f"{float(eps_j):.2e}"})
+
+        eps = float(eps_j)
+        # Frozen preconditioner for the sampling phase (rmsprop freezes here).
+        M_frozen = (1.0 / (jnp.sqrt(rms) + 1e-6)) if rmsprop else \
+            (precond_obj if kind == "diag" else jnp.zeros(()))
+
+        if bar is not None:
+            bar.set_description("SGLD sampling")
+
+        n_iter_sample = n_samples * thin
+        u_samples = np.empty((n_chains, n_samples, D), dtype=np.float64)
+        log_probs = np.empty((n_chains, n_samples), dtype=np.float64)
+        keep_idx, it_global = 0, 0
+        for size in _split_chunks(n_iter_sample, chunk_size):
+            key, keys = _chunk_keys(key, size, n_chains)
+            us, (u_h, lp_h) = samp_chunk(us, eps_j, M_frozen, keys)
+            u_h, lp_h = np.asarray(u_h), np.asarray(lp_h)
+            its = np.arange(it_global, it_global + size)
+            sel = np.nonzero((its + 1) % thin == 0)[0]
+            nk = len(sel)
+            u_samples[:, keep_idx:keep_idx + nk] = np.moveaxis(u_h[sel], 0, 1)
+            log_probs[:, keep_idx:keep_idx + nk] = np.moveaxis(lp_h[sel], 0, 1)
+            keep_idx += nk
+            it_global += size
+            if bar is not None:
+                bar.update(size)
+        accept_rate = np.full(n_chains, np.nan)   # unadjusted kernel
+        n_divergent = 0
 
     if bar is not None:
         bar.close()
@@ -661,6 +1199,8 @@ def run_sgld_posterior(problem, u_map, *,
                 min_ess_key = f"{k}[t={i}]"
 
     return SimpleNamespace(
+        method="mcmc",
+        kernel=kernel,
         samples_phys=samples_phys,
         u_samples=u_samples,
         log_probs=log_probs,
@@ -670,11 +1210,23 @@ def run_sgld_posterior(problem, u_map, *,
         step_size_history=eps_history,
         u_chain_init=np.asarray(u_chain_init),
         u_map=np.asarray(u_map),
+        hessian_u=(np.asarray(hessian_u) if hessian_u is not None else None),
+        hessian_ref=np.asarray(u_map),
+        cov_phys=(lap.cov_phys if lap is not None else None),
+        cov_phys_labels=(lap.labels if lap is not None else None),
+        laplace_sigma=(lap.sigma_by_prefix if lap is not None else None),
+        n_nonidentified=(lap.n_nonidentified if lap is not None else 0),
+        nonid_loadings=(lap.nonid_loadings if lap is not None else None),
+        nonid_descriptions=(lap.nonid_descriptions if lap is not None else []),
         varying_keys=problem.varying_keys,
         prefixes=list(samples_phys),
         temperature=problem_s.temperature,
         n_pixels_valid=problem_s.n_pixels_valid,
         step_size_final=eps,
+        accept_rate=accept_rate,
+        n_divergent=n_divergent,
+        n_leapfrog=(n_leapfrog if kernel in ("hmc", "mala") else 0),
+        adapt_target=adapt_target,
         n_chains=n_chains,
         n_samples=n_samples,
         burn_in=burn_in,
@@ -685,6 +1237,96 @@ def run_sgld_posterior(problem, u_map, *,
         max_rhat_key=max_rhat_key,
         min_ess=min_ess,
         min_ess_key=min_ess_key,
+        wall_time=t1 - t0,
+    )
+
+
+def run_sgld_posterior(problem, u_map, **kwargs):
+    """Backward-compatible alias: :func:`run_mcmc_posterior` with the legacy
+    SGLD kernel unless the caller picks another one."""
+    kwargs.setdefault("kernel", "sgld")
+    return run_mcmc_posterior(problem, u_map, **kwargs)
+
+
+def run_laplace_posterior(problem, u_map, *,
+                          temperature=None,
+                          polish_map=False, polish_max_iter=200,
+                          laplace_tol=1e-8):
+    """Hessian-only (Laplace) error bars at the MAP — no chains.
+
+    Computes the full Hessian of the Jacobian-corrected log-posterior at
+    ``u_map`` (analytic, or batched finite differences on the general
+    quadrature path), then the delta-method physical covariance
+    ``Σ_phys = J Σ_u Jᵀ``. Seconds instead of minutes; exact if the posterior
+    is Gaussian near the MAP, and a good first look before committing to a
+    full MCMC run. Non-identified (flat) directions are dropped from Σ and
+    reported with their physical-parameter loadings.
+
+    Returns a SimpleNamespace field-compatible with the MCMC result
+    (``summary`` has mean/std/p16/p50/p84/corr_intra; the sample- and
+    chain-specific fields are ``None``).
+    """
+    problem_s = build_sampling_problem(problem, temperature=temperature)
+    u_map = jnp.asarray(u_map, dtype=jnp.float64)
+
+    if polish_map:
+        u_ref = _polish_map(problem_s, u_map, max_iter=polish_max_iter)
+    else:
+        u_ref = u_map
+
+    t0 = time.time()
+    hessian_u = _full_hessian(problem_s, u_ref)
+    lap = _laplace_physical_cov(problem_s, u_ref, hessian_u, tol=laplace_tol)
+    _print_nonidentified(lap)
+
+    d0 = {k: np.asarray(v) for k, v in problem_s.resolve_one(u_ref).items()}
+    labels = lap.labels
+    Sig = lap.cov_phys
+    sig_flat = np.sqrt(np.clip(np.diag(Sig), 0.0, None))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr_full = Sig / np.outer(sig_flat, sig_flat)
+    corr_full = np.where(np.isfinite(corr_full), corr_full, 0.0)
+    np.fill_diagonal(corr_full, 1.0)
+
+    summary, i = {}, 0
+    for prefix, x in d0.items():
+        nt = x.shape[0]
+        sig = lap.sigma_by_prefix[prefix]
+        summary[prefix] = {
+            "mean": x,
+            "std":  sig,
+            "p16":  x - sig,
+            "p50":  x.copy(),
+            "p84":  x + sig,
+            "corr_intra": corr_full[i:i + nt, i:i + nt],
+        }
+        i += nt
+
+    t1 = time.time()
+    return SimpleNamespace(
+        method="laplace",
+        kernel="laplace",
+        samples_phys=None,
+        u_samples=None,
+        log_probs=None,
+        summary=summary,
+        rhat=None,
+        ess=None,
+        step_size_history=None,
+        u_chain_init=np.asarray(u_ref),
+        u_map=np.asarray(u_map),
+        hessian_u=np.asarray(hessian_u),
+        hessian_ref=np.asarray(u_ref),
+        cov_phys=lap.cov_phys,
+        cov_phys_labels=lap.labels,
+        laplace_sigma=lap.sigma_by_prefix,
+        n_nonidentified=lap.n_nonidentified,
+        nonid_loadings=lap.nonid_loadings,
+        nonid_descriptions=lap.nonid_descriptions,
+        varying_keys=problem.varying_keys,
+        prefixes=list(summary),
+        temperature=problem_s.temperature,
+        n_pixels_valid=problem_s.n_pixels_valid,
         wall_time=t1 - t0,
     )
 

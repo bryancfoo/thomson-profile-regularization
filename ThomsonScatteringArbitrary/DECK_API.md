@@ -50,7 +50,12 @@ Each entry is one of:
 normalized-velocity grid; default 10, kappa default 20 — raise it for
 fat-tailed distributions) and `n_points` (Simpson points; default 2001, forced
 odd). Accuracy of the dispersion integral scales as `(2·x_max/n_points)²`;
-runtime and memory scale linearly in `n_points`.
+runtime and memory scale linearly in `n_points`. `time_batch` controls how
+many time rows the quadrature vectorizes together: the default `"auto"`
+vectorizes the whole time axis when the `Nt·Nk·n_points` slab fits a 4 GiB
+budget and falls back to a sequential row map otherwise; an explicit int
+chunks that many rows at a time (intermediate chunk sizes measured *slower*
+than either extreme on a memory-bandwidth-bound CPU — see SPEED_NOTES.md).
 
 ### Shape parameters become fit parameters
 

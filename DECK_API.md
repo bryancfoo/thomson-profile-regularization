@@ -305,31 +305,64 @@ path = "fit_result.h5"
 
 Default (if omitted) is `<deck_stem>_result.h5` next to the deck file.
 
-### `[sampling]` — posterior sampling (optional)
+### `[sampling]` — posterior error bars (optional)
 
-Runs preconditioned SGLD after the MAP fit. Summary statistics and the
-raw chains both land in the primary HDF5 (set `save_samples = false` to
-drop the chains). Triggered by `enabled = true` here or by the `--sample`
-CLI flag on `thomson-fit`.
+Estimates parameter uncertainties after the MAP fit. Two methods:
+`method = "mcmc"` (default) runs multi-chain MCMC; `method = "laplace"`
+skips the chains entirely and derives 1σ error bars from the MAP Hessian
+(delta method) — seconds instead of minutes, exact when the posterior is
+Gaussian near the MAP, and a good first look before committing to chains.
+Summary statistics and (for MCMC) the raw chains land in the primary HDF5
+(set `save_samples = false` to drop the chains). Triggered by
+`enabled = true` here or by the `--sample` CLI flag on `thomson-fit`.
 
 ```toml
 [sampling]
 enabled         = true
+method          = "mcmc"      # "mcmc" | "laplace"
+kernel          = "hmc"       # "hmc" | "mala" | "sgld"   (mcmc only)
 n_samples       = 1000        # post-burn-in samples per chain
 n_chains        = 4
 burn_in         = 1000        # iterations before sampling; default = n_samples
 thin            = 1
 temperature     = "auto"      # "auto" | "unit" | positive float
-step_size       = 0.1         # initial; adapted in burn-in if adapt_step
+step_size       = 0.5         # initial; adapted in burn-in if adapt_step
+                              # (kernel defaults: 0.5 hmc/mala, 0.1 sgld)
+n_leapfrog      = 16          # hmc: max leapfrog steps; actual length is
+                              # drawn uniformly in [1, n_leapfrog] per iter
 adapt_step      = true
-adapt_target    = 0.3         # median drift/noise ratio to target
+adapt_target    = 0.8         # hmc: target acceptance (mala 0.574);
+                              # sgld: median drift/noise ratio (0.3)
 precond         = "diag_hessian"   # "diag_hessian" | "full_hessian" | "rmsprop" | "identity"
 perturb_scale   = 1.0         # per-chain init offset in posterior-std units
 seed            = 0
 polish_map      = false       # only useful if temperature ≈ 1
+chunk_size      = 100         # iterations per jitted scan chunk (perf knob)
 save_samples    = true        # write raw chains into the main HDF5
 save_cross_corr = true        # write the full (P·Nt × P·Nt) corr matrix
 ```
+
+**Kernels.** `hmc` (default) runs Metropolis-corrected leapfrog
+trajectories with the Hessian preconditioner as inverse mass matrix: each
+iteration costs ~`n_leapfrog/2` gradients but decorrelates far faster, its
+error bars carry no step-size bias, and the step size self-tunes to the
+target acceptance rate (dual averaging). It is the most robust choice for
+correlated or nearly-degenerate posteriors (e.g. shape↔temperature
+trade-offs in non-Maxwellian fits); divergent trajectories are rejected,
+counted, and reported. `mala` is HMC with a single leapfrog step — the
+cheapest exact kernel. `sgld` is the legacy unadjusted Langevin kernel
+(kept for reproducibility; biased at finite step size; the only kernel that
+supports `precond = "rmsprop"`).
+
+**Preconditioner and degeneracies.** For `diag_hessian`/`full_hessian` the
+full Hessian at the MAP is computed once (analytically, or by batched
+finite differences for general-path distributions) and reused for the
+preconditioner and the Laplace covariance. Directions of non-negative
+curvature — parameter combinations the data cannot pin down, e.g. a
+`p`↔`Te` trade-off — are dropped from the Laplace covariance, counted, and
+printed with their physical-parameter loadings (also exported under
+`/laplace/nonidentified_*`). `full_hessian` is the better mass matrix when
+such correlated directions dominate the posterior.
 
 **Temperature semantics.** `"auto"` resolves to `2 / N_pixels_valid`, which
 rescales the user's per-pixel-mean `V_fit = mean(r²/σ²) + Σ λ_o·mean(d_o²)`
@@ -341,13 +374,19 @@ loss convention; rebinning changes their width.
 
 **Outputs.** Everything lands in the primary HDF5 (`[output] path`):
 posterior summary statistics under `/summary/` (means, stds, 16/50/84
-percentiles, intra-prefix correlations, R-hat, ESS, optional full
-cross-correlation matrix) and the raw chains under `/samples/<prefix>` +
-`/u_samples` + `/log_probs` + `/step_size_history` + `/u_chain_init` +
-`/varying_keys`. Set `save_samples = false` to keep only the `/summary/`
-group and drop the raw chains (much smaller file). All samples are
-constraint-resolved, so `samples/ifract1` is the physical quantity
-`max(floor, 1 - ifract0)`, not the raw dummy.
+percentiles, intra-prefix correlations, R-hat, ESS, acceptance rate and
+divergence count for hmc/mala, optional full cross-correlation matrix), the
+MAP Hessian under `/hessian_u` (+ `/hessian_ref`, row/col order in
+`/varying_keys`), the Laplace covariance under `/laplace/` (`cov_phys`,
+`cov_phys_labels`, per-prefix `sigma/`, non-identified-direction loadings),
+and — for MCMC with `save_samples = true` — the raw chains under
+`/samples/<prefix>` + `/u_samples` + `/log_probs` + `/step_size_history` +
+`/u_chain_init`. With `method = "laplace"` the `/summary/` stds and
+percentiles come from the delta-method covariance and no chains are
+written. All samples are constraint-resolved, so `samples/ifract1` is the
+physical quantity `max(floor, 1 - ifract0)`, not the raw dummy. Note the
+Laplace σ is one-sided if the MAP sits exactly on a non-smooth constraint
+kink (e.g. at the `max(...)` floor); the MCMC error bars are unaffected.
 
 ### `[l_curve]` — Tikhonov L-curve sweep (optional)
 

@@ -393,8 +393,15 @@ def _plot_l_curve(lc, png_path, shot_num):
 
 def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
                         map_result, sampling_settings):
-    """Run multi-chain SGLD given a finished MAP fit. Returns sampling result."""
-    from ThomsonScatteringArbitrary.sampling import run_sgld_posterior
+    """Run posterior error-bar estimation given a finished MAP fit.
+
+    ``[sampling] method`` selects the estimator: ``"mcmc"`` (default) runs
+    multi-chain MCMC with the deck's ``kernel`` (hmc/mala/sgld); ``"laplace"``
+    skips the chains and returns Hessian (delta-method) error bars in seconds.
+    """
+    from ThomsonScatteringArbitrary.sampling import (
+        run_mcmc_posterior, run_laplace_posterior,
+    )
 
     # shard_time=False: the per-chain vmap in the sampler does not compose with
     # the shard_map inside the objective, so the sampler always uses the
@@ -411,25 +418,56 @@ def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
         for i in range(len(x_phys))
     ])
 
-    # Map deck fields → run_sgld_posterior kwargs. Defaults match the
-    # function signature except for the temperature sentinel.
+    # Map deck fields → sampler kwargs. Defaults match the function
+    # signatures except for the temperature sentinel.
     s = dict(sampling_settings)
     s.pop("enabled", None)
     s.pop("save_samples", None)
     s.pop("save_cross_corr", None)
+    method = s.pop("method", "mcmc")
     # Temperature default sentinel: "auto" → None inside the sampler
     if "temperature" not in s:
         s["temperature"] = None
     elif s["temperature"] == "auto":
         s["temperature"] = None
 
-    print("\nRunning SGLD posterior sampling...")
-    samp = run_sgld_posterior(problem, u_map, progress=True, **s)
+    if method == "laplace":
+        print("\nComputing Laplace (MAP-Hessian) error bars...")
+        allowed = {"temperature", "polish_map", "polish_max_iter", "laplace_tol"}
+        dropped = sorted(set(s) - allowed)
+        if dropped:
+            print(f"  [sampling] ignoring MCMC-only keys with method='laplace': "
+                  f"{', '.join(dropped)}")
+        samp = run_laplace_posterior(
+            problem, u_map, **{k: v for k, v in s.items() if k in allowed})
+        print(f"  Laplace error bars done | T={samp.temperature:.2e} | "
+              f"wall {samp.wall_time:.1f}s")
+        return samp
+    if method != "mcmc":
+        raise ValueError(f"Unknown [sampling] method: {method!r} "
+                         "(choose 'mcmc' or 'laplace').")
+
+    kernel = s.get("kernel", "hmc")
+    print(f"\nRunning {kernel.upper()} posterior sampling...")
+    samp = run_mcmc_posterior(problem, u_map, progress=True, **s)
     print(
-        f"\nSGLD: {samp.n_chains} chains × {samp.n_samples} samples "
+        f"\n{kernel.upper()}: {samp.n_chains} chains × {samp.n_samples} samples "
         f"(burn {samp.burn_in}, thin {samp.thin}) | "
         f"step={samp.step_size_final:.2e} | T={samp.temperature:.2e}"
     )
+    if samp.kernel in ("hmc", "mala"):
+        acc = np.asarray(samp.accept_rate)
+        print(f"  accept rate = {np.nanmean(acc):.2f} "
+              f"(per chain: {', '.join(f'{a:.2f}' for a in acc)}) | "
+              f"divergences = {samp.n_divergent}")
+        if samp.n_divergent > 0:
+            print("  WARNING: divergent trajectories detected; error bars may "
+                  "be unreliable. Try a smaller step_size or check for "
+                  "unbounded free parameters (NaN gradients).")
+        if np.nanmin(acc) < 0.1:
+            print("  WARNING: a chain accepted <10% of proposals — its "
+                  "samples are nearly frozen. Try a smaller step_size, a "
+                  "longer burn_in, or kernel='hmc' if using 'mala'.")
     print(
         f"  max R-hat = {samp.max_rhat:.3f} ({samp.max_rhat_key}) | "
         f"min ESS = {samp.min_ess:.0f} ({samp.min_ess_key}) | "
