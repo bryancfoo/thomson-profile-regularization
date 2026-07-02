@@ -411,10 +411,19 @@ streak_png     = "streak.png"
 profiles_png   = "profiles.png"
 
 # Option 1 — explicit variable list (recommended).
-# Each key becomes its own subplot, auto-laid-out up to 4 per row.
-# Valid keys are any parameter prefix that appears in the results HDF5
-# (e.g. "n", "Te0", "Ti0", "Ti1", "ui0", "ifract0", "ifract1", "pe0", ...).
+# Subplots are auto-laid-out up to 3 per row. Valid keys are any parameter
+# prefix that appears in the results HDF5 (e.g. "n", "Te0", "Ti0", "Ti1",
+# "ui0", "ifract0", "ifract1", "pe0", ...).
+#
+#   Flat form    — each key gets its own subplot:
 profile_vars   = ["n", "Te0", "Ti0", "ifract0"]
+#
+#   Grouped form — each inner list is overlaid on one shared subplot with a
+#   legend (handy for comparing all temperatures, all flows, etc.):
+# profile_vars = [["Ti0", "Ti1"], ["ifract0", "ifract1"], ["ui0", "ui1"]]
+#
+# The two forms may be mixed: a bare string is treated as a singleton group,
+# e.g. ["n", ["Ti0", "Ti1"]] gives n its own subplot and Ti0/Ti1 a shared one.
 
 # Option 2 — legacy preset layout (used when profile_vars is absent).
 # "epw" plots n / Te0 / pe0; "iaw" plots a fixed 4×2 IAW grid.

@@ -164,8 +164,28 @@ def _full_hessian_fd(problem_s, u_ref, *, h=1e-4):
     return jnp.asarray(0.5 * (H + H.T))
 
 
+def _full_hessian(problem_s, u_ref):
+    """Full Hessian of ``target_log_prob`` at ``u_ref`` (analytic; FD fallback).
+
+    This is the Hessian of the *temperature-scaled, Jacobian-corrected*
+    log-posterior, so ``-inv(H)`` is the Laplace covariance in u-space and the
+    eigenvalues should be negative at a well-formed MAP. Symmetrized and
+    NaN-cleaned. Falls back to finite differences when JAX lacks a
+    2nd-derivative rule for the forward model (e.g. ``gammaincc`` with free
+    ``pe``/``pi``).
+    """
+    try:
+        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+    except NotImplementedError as err:
+        print(f"  [hessian] analytical Hessian unavailable ({err}); "
+              f"falling back to finite-difference Hessian.")
+        H = _full_hessian_fd(problem_s, u_ref)
+    H = jnp.where(jnp.isfinite(H), H, 0.0)
+    return 0.5 * (H + H.T)
+
+
 def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
-                                fallback=1.0):
+                                fallback=1.0, H=None):
     """Diagonal preconditioner from |H(target_log_prob)(u_ref)|.
 
     Returns ``M_diag`` of shape (D,) with ``M_diag[i] = 1 / max(|H_ii|, floor)``.
@@ -174,21 +194,25 @@ def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
     finite-difference diagonal when JAX hits a missing 2nd-derivative rule
     (e.g. ``gammaincc`` w.r.t. ``a`` with free ``pe``/``pi``). Non-finite
     entries are replaced with ``fallback`` so a single bad coordinate
-    doesn't NaN the entire preconditioner.
+    doesn't NaN the entire preconditioner. If ``H`` (a precomputed full Hessian
+    at ``u_ref``) is given, its diagonal is reused instead of recomputing.
     """
-    try:
-        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+    if H is not None:
         h_diag = jnp.abs(jnp.diag(H))
-    except NotImplementedError as err:
-        print(f"  [precond=diag_hessian] analytical Hessian unavailable "
-              f"({err}); falling back to finite-difference diagonal.")
-        h_diag = jnp.abs(_diag_hessian_fd(problem_s, u_ref))
+    else:
+        try:
+            H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+            h_diag = jnp.abs(jnp.diag(H))
+        except NotImplementedError as err:
+            print(f"  [precond=diag_hessian] analytical Hessian unavailable "
+                  f"({err}); falling back to finite-difference diagonal.")
+            h_diag = jnp.abs(_diag_hessian_fd(problem_s, u_ref))
     h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
     M = 1.0 / jnp.maximum(h_diag, floor)
     return jnp.where(jnp.isfinite(M), M, 1.0)
 
 
-def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6):
+def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6, H=None):
     """Full Hessian preconditioner ``M = (|H| + reg·I)^{-1}``.
 
     Builds an SPD approximation by taking the absolute eigenvalues, so the
@@ -197,20 +221,67 @@ def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6):
     (``L_chol L_chol^T = M``).
 
     Falls back to finite-difference Hessian when JAX's analytical 2nd
-    derivatives aren't supported for the forward model.
+    derivatives aren't supported for the forward model. If ``H`` (a precomputed
+    full Hessian at ``u_ref``) is given, it is reused instead of recomputing.
     """
-    try:
-        H = _jax.hessian(problem_s.target_log_prob)(u_ref)
-    except NotImplementedError as err:
-        print(f"  [precond=full_hessian] analytical Hessian unavailable "
-              f"({err}); falling back to finite-difference Hessian.")
-        H = _full_hessian_fd(problem_s, u_ref)
-    H = jnp.where(jnp.isfinite(H), H, 0.0)
+    if H is None:
+        try:
+            H = _jax.hessian(problem_s.target_log_prob)(u_ref)
+        except NotImplementedError as err:
+            print(f"  [precond=full_hessian] analytical Hessian unavailable "
+                  f"({err}); falling back to finite-difference Hessian.")
+            H = _full_hessian_fd(problem_s, u_ref)
+        H = jnp.where(jnp.isfinite(H), H, 0.0)
     w, V = jnp.linalg.eigh(0.5 * (H + H.T))
     w_abs = jnp.maximum(jnp.abs(w), 0.0) + reg
     M = (V * (1.0 / w_abs)) @ V.T
     L = (V * (1.0 / jnp.sqrt(w_abs))) @ V.T
     return M, L
+
+
+def _laplace_physical_cov(problem_s, u_ref, hessian_u, *, tol=1e-8):
+    """Delta-method physical-parameter covariance from the MAP Hessian.
+
+    With ``Σ_u = -inv(H)`` the Laplace covariance in u-space and
+    ``J = ∂(physical)/∂u`` (Jacobian of ``resolve_one``), the physical
+    covariance is ``Σ_phys = J Σ_u Jᵀ`` (P×P). It is rank ≤ D — singular along
+    the constraints (tied species, the simplex remainder) — so it has no full
+    inverse, but its diagonal gives valid 1σ physical error bars and any
+    sub-block/linear combo is well-defined.
+
+    Eigenvalues of H are negative at a maximum; any ``> -tol·|λ|max`` flag a
+    non-identified direction (infinite u-space variance). Those are dropped from
+    ``Σ_u`` (so they don't blow the matrix up) and counted in the return value.
+
+    Returns ``(Sigma_phys, labels, sigma_by_prefix, n_nonidentified)``:
+    ``labels`` are ``"<prefix>[t=k]"`` matching the row/col order, and
+    ``sigma_by_prefix`` maps each prefix to its ``(Nt,)`` 1σ array.
+    """
+    u_ref = jnp.asarray(u_ref)
+    d0 = problem_s.resolve_one(u_ref)
+    prefixes = list(d0.keys())
+    nts = {p: int(d0[p].shape[0]) for p in prefixes}
+
+    def flat_resolve(u):
+        d = problem_s.resolve_one(u)
+        return jnp.concatenate([d[p] for p in prefixes])
+
+    J = _jax.jacfwd(flat_resolve)(u_ref)                       # (P, D)
+    w, V = jnp.linalg.eigh(0.5 * (hessian_u + hessian_u.T))    # ascending
+    wmax = jnp.maximum(jnp.max(jnp.abs(w)), 1.0)
+    bad = w > -tol * wmax                                       # non-negative curvature
+    inv_var = jnp.where(bad, 0.0, -1.0 / w)                    # -1/λ for λ < 0
+    Sigma_u = (V * inv_var) @ V.T
+    Sigma_phys = J @ Sigma_u @ J.T
+    Sigma_phys = np.asarray(0.5 * (Sigma_phys + Sigma_phys.T))
+
+    sigma_flat = np.sqrt(np.clip(np.diag(Sigma_phys), 0.0, None))
+    labels, sigma_by_prefix, i = [], {}, 0
+    for p in prefixes:
+        labels += [f"{p}[t={t}]" for t in range(nts[p])]
+        sigma_by_prefix[p] = sigma_flat[i:i + nts[p]]
+        i += nts[p]
+    return Sigma_phys, labels, sigma_by_prefix, int(np.sum(np.asarray(bad)))
 
 
 # ─── SGLD step kernels ──────────────────────────────────────────────────────
@@ -457,8 +528,21 @@ def run_sgld_posterior(problem, u_map, *,
     # sampler targets a fixed invariant distribution.
     kind = "diag" if precond in ("diag_hessian", "identity", "rmsprop") else "full"
     rmsprop_state = None
+
+    # Full Hessian of the (temperature-scaled, Jacobian-corrected) log-posterior
+    # at the MAP, saved to the output for Laplace-style error estimation
+    # (-inv(hessian_u) is the posterior covariance in u-space). For the
+    # Hessian-based preconditioners it is also reused so it is computed at most
+    # once (the diagonal precond already builds the full Hessian internally).
+    # When chains are re-centred via polish_map the preconditioner is rebuilt at
+    # the polished point, while hessian_u stays at the LBFGS MAP as requested.
+    hessian_u = None
+    if precond in ("diag_hessian", "full_hessian"):
+        hessian_u = _full_hessian(problem_s, u_map)
+    H_for_precond = hessian_u if (hessian_u is not None and not polish_map) else None
+
     if precond == "diag_hessian":
-        M_diag = _build_diag_hessian_precond(problem_s, u_chain_init)
+        M_diag = _build_diag_hessian_precond(problem_s, u_chain_init, H=H_for_precond)
         precond_obj = M_diag
     elif precond == "identity":
         M_diag = jnp.ones(D, dtype=jnp.float64)
@@ -468,11 +552,23 @@ def run_sgld_posterior(problem, u_map, *,
         rmsprop_state = jnp.ones(D, dtype=jnp.float64)  # v_EMA initial
         precond_obj = M_diag
     elif precond == "full_hessian":
-        M_full, L_chol = _build_full_hessian_precond(problem_s, u_chain_init)
+        M_full, L_chol = _build_full_hessian_precond(problem_s, u_chain_init, H=H_for_precond)
         precond_obj = (M_full, L_chol)
     else:
         raise ValueError(f"Unknown precond: {precond!r}. Choose "
                          "'diag_hessian', 'full_hessian', 'rmsprop', or 'identity'.")
+
+    # Laplace physical-parameter covariance at the MAP (delta method through the
+    # constraint map). Σ_phys is singular along the constraints, but its diagonal
+    # gives valid 1σ physical error bars (exported as laplace/sigma).
+    cov_phys = cov_phys_labels = laplace_sigma = None
+    n_nonidentified = 0
+    if hessian_u is not None:
+        cov_phys, cov_phys_labels, laplace_sigma, n_nonidentified = \
+            _laplace_physical_cov(problem_s, u_map, hessian_u)
+        if n_nonidentified:
+            print(f"  [laplace] {n_nonidentified} non-identified direction(s) at the "
+                  f"MAP (non-negative Hessian curvature); dropped from Σ_phys.")
 
     # Build the per-chain step function. When the host exposes >1 device with at
     # least one device per chain (and parallelism isn't disabled), map the chains
@@ -639,6 +735,12 @@ def run_sgld_posterior(problem, u_map, *,
         step_size_history=eps_history,
         u_chain_init=np.asarray(u_chain_init),
         u_map=np.asarray(u_map),
+        hessian_u=(np.asarray(hessian_u) if hessian_u is not None else None),
+        hessian_ref=np.asarray(u_map),
+        cov_phys=cov_phys,
+        cov_phys_labels=cov_phys_labels,
+        laplace_sigma=laplace_sigma,
+        n_nonidentified=n_nonidentified,
         varying_keys=problem.varying_keys,
         prefixes=list(samples_phys),
         temperature=problem_s.temperature,

@@ -292,27 +292,61 @@ def _ylabel_for_key(key):
     return _YLABEL_MAP.get(base, key)
 
 
+def _normalize_profile_groups(profile_vars):
+    """Normalize ``profile_vars`` into a list of groups, one group per subplot.
+
+    Accepts either the legacy flat form ``["n", "Te0", "Ti0"]`` (each key on its
+    own subplot) or the grouped form ``[["Ti0", "Ti1"], ["ui0", "ui1"]]`` (each
+    inner list overlaid on a shared subplot). The two forms may be mixed: a bare
+    string is treated as a singleton group.
+    """
+    groups = []
+    for entry in profile_vars:
+        if isinstance(entry, str):
+            groups.append([entry])
+        else:
+            keys = [k for k in entry if k]
+            if keys:
+                groups.append(list(keys))
+    return groups
+
+
+def _group_title(group):
+    """Title for a subplot: the shared base name if every key shares one
+    (e.g. ``["Ti0", "Ti1"]`` -> ``"Ti"``), otherwise the keys joined."""
+    bases = {k.rstrip("0123456789") for k in group}
+    if len(bases) == 1:
+        return next(iter(bases))
+    return ", ".join(group)
+
+
 def _plot_profiles_generic(profiles, time_axis, png_path, shot_num, profile_vars):
-    """Plot an arbitrary list of profile keys, auto-laid-out up to 4 per row."""
+    """Plot grouped profile keys, one subplot per group, auto-laid-out up to 3
+    per row. Keys within a group are overlaid on the same axes with a legend."""
     import math as _math
-    n_vars = len(profile_vars)
-    if n_vars == 0:
+    groups = _normalize_profile_groups(profile_vars)
+    n_groups = len(groups)
+    if n_groups == 0:
         return
-    ncols = min(3, n_vars)
-    nrows = _math.ceil(n_vars / ncols)
+    ncols = min(3, n_groups)
+    nrows = _math.ceil(n_groups / ncols)
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols,
                              figsize=(4.5 * ncols, 3.5 * nrows), squeeze=False)
-    for idx, key in enumerate(profile_vars):
+    for idx, group in enumerate(groups):
         ax = axes[idx // ncols][idx % ncols]
-        if key in profiles:
-            ax.plot(time_axis, profiles[key])
-        else:
-            ax.text(0.5, 0.5, f"'{key}' not in results",
+        plotted = [k for k in group if k in profiles]
+        for key in plotted:
+            ax.plot(time_axis, profiles[key], label=key)
+        missing = [k for k in group if k not in profiles]
+        if not plotted:
+            ax.text(0.5, 0.5, f"{', '.join(missing)} not in results",
                     ha="center", va="center", transform=ax.transAxes, color="gray")
+        elif len(plotted) > 1:
+            ax.legend(fontsize="small")
         ax.set_xlabel("Time [ns]")
-        ax.set_ylabel(_ylabel_for_key(key))
-        ax.set_title(key)
-    for idx in range(n_vars, nrows * ncols):
+        ax.set_ylabel(_ylabel_for_key(group[0]))
+        ax.set_title(_group_title(group))
+    for idx in range(n_groups, nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
     fig.suptitle(f"Shot {shot_num} fitted profiles")
     fig.tight_layout()

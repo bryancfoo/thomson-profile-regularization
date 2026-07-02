@@ -463,10 +463,11 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
                             save_samples=True):
     """Write posterior summary + (optionally) raw samples into ``fh``.
 
-    Writes the ``/summary/...`` group always. When ``save_samples`` is True,
-    additionally writes the full posterior chains under ``/samples/<prefix>``
-    plus ``/u_samples``, ``/log_probs``, ``/step_size_history``,
-    ``/varying_keys``, and ``/u_chain_init``.
+    Writes the ``/summary/...`` group, ``/varying_keys``, and (when available)
+    the MAP-Hessian ``/hessian_u`` + ``/hessian_ref`` always. When
+    ``save_samples`` is True, additionally writes the full posterior chains
+    under ``/samples/<prefix>`` plus ``/u_samples``, ``/log_probs``,
+    ``/step_size_history``, and ``/u_chain_init``.
     """
     import h5py
     summary = fh.create_group("summary")
@@ -518,6 +519,33 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
     summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
     summary.attrs["wall_time_s"]    = float(samp.wall_time)
 
+    # Always save the param ordering (it labels both the Hessian axes and the
+    # u-space arrays) and the full Hessian of the log-posterior at the MAP.
+    # The Hessian is a single (D, D) matrix; -inv(hessian_u) is the Laplace
+    # covariance in u-space. Its row/col order matches /varying_keys.
+    fh.create_dataset(
+        "varying_keys",
+        data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
+    )
+    if getattr(samp, "hessian_u", None) is not None:
+        fh.create_dataset("hessian_u",   data=_np.asarray(samp.hessian_u))
+        fh.create_dataset("hessian_ref", data=_np.asarray(samp.hessian_ref))
+
+    # Laplace physical-parameter covariance at the MAP: the full (singular) P×P
+    # matrix plus per-prefix 1σ error bars (sqrt of its diagonal), so they sit
+    # alongside summary/std. Row/col order of cov_phys matches cov_phys_labels.
+    if getattr(samp, "cov_phys", None) is not None:
+        lap = fh.create_group("laplace")
+        lap.create_dataset("cov_phys", data=_np.asarray(samp.cov_phys))
+        lap.create_dataset(
+            "cov_phys_labels",
+            data=_np.array(samp.cov_phys_labels, dtype=h5py.string_dtype()),
+        )
+        sig_g = lap.create_group("sigma")
+        for prefix, arr in samp.laplace_sigma.items():
+            sig_g.create_dataset(prefix, data=_np.asarray(arr))
+        lap.attrs["n_nonidentified"] = int(getattr(samp, "n_nonidentified", 0))
+
     if save_samples:
         samples_grp = fh.create_group("samples")
         for prefix, arr in samp.samples_phys.items():
@@ -526,7 +554,3 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
         fh.create_dataset("log_probs",         data=_np.asarray(samp.log_probs))
         fh.create_dataset("step_size_history", data=_np.asarray(samp.step_size_history))
         fh.create_dataset("u_chain_init",      data=_np.asarray(samp.u_chain_init))
-        fh.create_dataset(
-            "varying_keys",
-            data=_np.array(samp.varying_keys, dtype=h5py.string_dtype()),
-        )
