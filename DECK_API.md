@@ -248,9 +248,20 @@ ifract5 = "1 - ifract0 - ifract1 - ifract2 - ifract3 - ifract4"
 ```
 
 Functions available inside expressions: `min`, `max`, `abs`, `where`,
-`clip`, `sqrt`, `exp`, `log`, plus arithmetic. Constrained prefixes are
-removed from the free-variable vector — their values are derived at
-forward-eval time from the constrained-prefix expression.
+`clip`, `sqrt`, `exp`, `log`, `smin`, `smax`, plus arithmetic. Constrained
+prefixes are removed from the free-variable vector — their values are
+derived at forward-eval time from the constrained-prefix expression.
+
+**Smooth variants for sampling.** `smax(a, b, w)` / `smin(a, b, w)` are
+C^∞ replacements for `max` / `min` (`w·logaddexp(a/w, b/w)`; transition
+width ~`w`, default 0.01). The hard forms have a gradient kink that stalls
+the HMC/MALA samplers — leapfrog energy errors at the kink force the step
+size down and mixing across the kink direction becomes very slow (the MAP
+fit itself is unaffected). If a deck with `max`/`min`/`abs`/`clip`/`where`
+constraints will be sampled with `kernel = "hmc"`, prefer the smooth forms,
+e.g. `ifract1 = "smax(ifract1_floor, 1 - ifract0, 0.005)"`, or use
+`method = "laplace"` / `kernel = "sgld"` (the latter tolerates kinks but
+carries a step-size bias).
 
 ### `[penalty.<prefix>]` — Tikhonov regularization
 
@@ -328,8 +339,11 @@ thin            = 1
 temperature     = "auto"      # "auto" | "unit" | positive float
 step_size       = 0.5         # initial; adapted in burn-in if adapt_step
                               # (kernel defaults: 0.5 hmc/mala, 0.1 sgld)
-n_leapfrog      = 16          # hmc: max leapfrog steps; actual length is
-                              # drawn uniformly in [1, n_leapfrog] per iter
+traj_length     = 1.5         # hmc: target eps·L per trajectory, in
+                              # preconditioned-σ units; L per iteration is
+                              # uniform in [1, clip(ceil(traj_length/eps),
+                              # 1, n_leapfrog)]
+n_leapfrog      = 64          # hmc: hard cap on leapfrog steps per iter
 adapt_step      = true
 adapt_target    = 0.8         # hmc: target acceptance (mala 0.574);
                               # sgld: median drift/noise ratio (0.3)
@@ -343,16 +357,22 @@ save_cross_corr = true        # write the full (P·Nt × P·Nt) corr matrix
 ```
 
 **Kernels.** `hmc` (default) runs Metropolis-corrected leapfrog
-trajectories with the Hessian preconditioner as inverse mass matrix: each
-iteration costs ~`n_leapfrog/2` gradients but decorrelates far faster, its
-error bars carry no step-size bias, and the step size self-tunes to the
-target acceptance rate (dual averaging). It is the most robust choice for
+trajectories with the Hessian preconditioner as inverse mass matrix: the
+step size self-tunes to the target acceptance rate (dual averaging) and the
+leapfrog count per iteration tracks `traj_length/eps`, so proposals keep
+travelling O(1) posterior widths even when curvature (e.g. a constraint
+kink) forces the step size down. Each iteration costs the drawn number of
+gradients (`avg leapfrog` is reported), but decorrelates far faster than a
+Langevin step and its error bars carry no step-size bias — on the
+`iaw_sample` example the legacy SGLD error bars are ~2× wider than the
+agreeing HMC and Laplace results. It is the most robust choice for
 correlated or nearly-degenerate posteriors (e.g. shape↔temperature
 trade-offs in non-Maxwellian fits); divergent trajectories are rejected,
 counted, and reported. `mala` is HMC with a single leapfrog step — the
-cheapest exact kernel. `sgld` is the legacy unadjusted Langevin kernel
-(kept for reproducibility; biased at finite step size; the only kernel that
-supports `precond = "rmsprop"`).
+cheapest exact kernel, but sensitive to curvature heterogeneity. `sgld` is
+the legacy unadjusted Langevin kernel (kept for reproducibility; **biased
+at finite step size** — it can substantially overestimate error bars; the
+only kernel that supports `precond = "rmsprop"`).
 
 **Preconditioner and degeneracies.** For `diag_hessian`/`full_hessian` the
 full Hessian at the MAP is computed once (analytically, or by batched

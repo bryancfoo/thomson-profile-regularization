@@ -99,10 +99,28 @@ def _tikhonov_penalty(param_array, profile_axis, lambda_weights, thresholds,
 
 # ─── constraint compilation ──────────────────────────────────────────────────
 
+def _smax(a, b, w=0.01):
+    """Smooth max: ``w·logaddexp(a/w, b/w)`` → max(a, b) as w → 0.
+
+    Drop-in replacement for ``max(a, b)`` in constraint expressions when the
+    result is sampled: the hard max has a gradient kink that stalls the
+    HMC/MALA kernels (leapfrog energy errors at the kink force the step size
+    down), while ``smax`` is C^∞ with a transition region of width ~w.
+    Choose ``w`` small against the scale of ``a - b`` near the fit.
+    """
+    return w * jnp.logaddexp(a / w, b / w)
+
+
+def _smin(a, b, w=0.01):
+    """Smooth min: ``-smax(-a, -b, w)``."""
+    return -_smax(-a, -b, w)
+
+
 # Namespace exposed to constraint expressions. `min` / `max` are the binary
 # jnp variants — matches the 2-arg form documented in the deck schema.
 _CONSTRAINT_NS = {
     "min": jnp.minimum, "max": jnp.maximum,
+    "smin": _smin, "smax": _smax,
     "abs": jnp.abs, "where": jnp.where, "clip": jnp.clip,
     "sqrt": jnp.sqrt, "exp": jnp.exp, "log": jnp.log,
     "__builtins__": {},

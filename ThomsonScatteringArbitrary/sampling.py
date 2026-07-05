@@ -55,8 +55,8 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from jax import jit, lax, value_and_grad, vmap, pmap
+from jax.nn import log_sigmoid, sigmoid
 
-from .fitting import _log_det_jac_u
 from .parallel import serial_requested
 
 
@@ -82,9 +82,82 @@ def _resolve_temperature(temperature, problem):
     return t
 
 
+def _make_sampling_bijector(problem):
+    """Sampler-side unconstrained transform: logistic for two-sided bounds.
+
+    The FIT uses lmfit's arcsin transform for two-sided bounds — fine for
+    LBFGS, but *periodic* in u, and its Jacobian term log|cos u| puts -inf
+    walls at u = ±π/2 (the x-bounds). A weakly identified bounded parameter
+    (e.g. an inactive constraint dummy like ``ifract1_floor``) diffuses along
+    its flat direction, keeps hitting those walls (unbounded gradients →
+    step size collapses for every coordinate), and can even leapfrog across
+    onto another sin branch. The sampler therefore re-parametrizes two-sided
+    bounds with the logistic bijector
+
+        x = lo + (hi - lo)·sigmoid(u),
+        log|dx/du| = log(hi-lo) + log_sigmoid(u) + log_sigmoid(-u),
+
+    which is monotone, aperiodic, and has d(log-jac)/du = 1 - 2·sigmoid(u)
+    bounded in (-1, 1) — no walls, exponential (not singular) tails, and its
+    implicit u-space prior is a well-scaled logistic bell (σ ≈ 1.8). The fit
+    itself is untouched; only the sampling coordinates change. One-sided and
+    unbounded coordinates reuse the fit's forms (already smooth/aperiodic).
+
+    Returns ``(to_x, log_det_jac, to_u_np)``.
+    """
+    lo, hi = problem.lower, problem.upper
+    lo_f, hi_f = jnp.isfinite(lo), jnp.isfinite(hi)
+    two_sided = lo_f & hi_f
+    lo_only = lo_f & ~hi_f
+    hi_only = ~lo_f & hi_f
+    lo_s = jnp.where(lo_f, lo, 0.0)
+    hi_s = jnp.where(hi_f, hi, 1.0)
+    width = jnp.where(two_sided, hi_s - lo_s, 1.0)
+
+    def to_x(u):
+        x_b = lo_s + width * sigmoid(u)
+        x_l = lo_s - 1.0 + jnp.sqrt(u ** 2 + 1.0)
+        x_h = hi_s + 1.0 - jnp.sqrt(u ** 2 + 1.0)
+        return jnp.where(two_sided, x_b,
+                         jnp.where(lo_only, x_l,
+                                   jnp.where(hi_only, x_h, u)))
+
+    def log_det_jac(u):
+        lj_b = jnp.log(width) + log_sigmoid(u) + log_sigmoid(-u)
+        one_sided = jnp.log(jnp.maximum(jnp.abs(u), 1e-30)) \
+            - 0.5 * jnp.log(u ** 2 + 1.0)
+        lj = jnp.where(two_sided, lj_b,
+                       jnp.where(lo_only | hi_only, one_sided, 0.0))
+        return jnp.sum(lj)
+
+    lo_np, hi_np = np.asarray(problem.lower_np), np.asarray(problem.upper_np)
+
+    def to_u_np(x):
+        x = np.asarray(x, dtype=np.float64)
+        u = np.array(x)
+        for i in range(x.shape[0]):
+            l, h = lo_np[i], hi_np[i]
+            if np.isfinite(l) and np.isfinite(h):
+                frac = np.clip((x[i] - l) / (h - l), 1e-12, 1.0 - 1e-12)
+                u[i] = np.log(frac) - np.log1p(-frac)
+            elif np.isfinite(l):
+                u[i] = np.sqrt(max((x[i] - l + 1.0) ** 2 - 1.0, 0.0))
+            elif np.isfinite(h):
+                u[i] = np.sqrt(max((h - x[i] + 1.0) ** 2 - 1.0, 0.0))
+        return u
+
+    return to_x, log_det_jac, to_u_np
+
+
 def build_sampling_problem(problem, *, temperature=None):
     """Wrap a fit problem with a Jacobian-corrected, temperature-rescaled
     sampling target.
+
+    The target lives in the sampler's own unconstrained coordinates (see
+    :func:`_make_sampling_bijector` — logistic for two-sided bounds, the
+    fit's transforms elsewhere), NOT the fit's arcsin coordinates. Callers
+    that hold the fit-space MAP should convert with
+    ``u_s = problem_s.u_from_fit(u_fit)``.
 
     Parameters
     ----------
@@ -102,21 +175,19 @@ def build_sampling_problem(problem, *, temperature=None):
         target_log_prob_and_grad(u) -> (logp, glogp)
         log_det_jac(u) -> scalar
         resolve_one(u) -> dict[prefix -> (Nt,) jnp.ndarray]
+        to_x(u) / u_from_x_np(x) / u_from_fit(u_fit)
         temperature : float
         n_pixels_valid : int
     """
     T = _resolve_temperature(temperature, problem)
-    lower = problem.lower
-    upper = problem.upper
 
     mask = jnp.isnan(problem.Pkl_data) | jnp.isnan(problem.Pkl_var)
     n_pix = int(jnp.sum(~mask))
 
-    def log_det_jac(u):
-        return _log_det_jac_u(u, lower, upper)
+    to_x, log_det_jac, to_u_np = _make_sampling_bijector(problem)
 
     def target_log_prob(u):
-        return -problem.objective_u(u) / T + log_det_jac(u)
+        return -problem.objective_flat(to_x(u)) / T + log_det_jac(u)
 
     log_det_jac_jit = jit(log_det_jac)
     target_log_prob_jit = jit(target_log_prob)
@@ -124,8 +195,13 @@ def build_sampling_problem(problem, *, temperature=None):
 
     @jit
     def resolve_one(u):
-        x_phys = problem.to_external_jax(u)
-        return problem.build_params_dict(x_phys)
+        return problem.build_params_dict(to_x(u))
+
+    def u_from_fit(u_fit):
+        """Convert a FIT-space (arcsin) unconstrained vector to sampling
+        coordinates via physical space."""
+        x = np.asarray(problem.to_external_jax(jnp.asarray(u_fit)))
+        return to_u_np(x)
 
     return SimpleNamespace(
         problem=problem,
@@ -135,6 +211,9 @@ def build_sampling_problem(problem, *, temperature=None):
         target_log_prob=target_log_prob_jit,
         target_log_prob_and_grad=target_log_prob_and_grad_jit,
         resolve_one=resolve_one,
+        to_x=jit(to_x),
+        u_from_x_np=to_u_np,
+        u_from_fit=u_from_fit,
     )
 
 
@@ -219,11 +298,32 @@ def _full_hessian(problem_s, u_ref):
     return 0.5 * (H + H.T)
 
 
+def _curvature_floors(problem, *, floor=1e-6):
+    """Per-coordinate lower bound on the |Hessian| used in preconditioners.
+
+    A two-sided bounded parameter lives on the sampler's logistic bijector:
+    even a completely flat direction (e.g. an inactive constraint dummy like
+    ``ifract1_floor``) has the implicit logistic u-prior, variance π²/3 ≈ 3.3
+    — so its preconditioner variance is capped at 4 by flooring the
+    curvature at 1/4. Without this, a direction that is flat at the MAP gets
+    curvature ~0 → preconditioner variance up to 1/floor = 1e6 → chains are
+    initialized and kicked absurd distances along it, and the step size
+    collapses for every other coordinate. One-sided / unbounded coordinates
+    keep the generic ``floor``.
+    """
+    lo, hi = np.asarray(problem.lower_np), np.asarray(problem.upper_np)
+    bounded = np.isfinite(lo) & np.isfinite(hi)
+    return jnp.asarray(np.where(bounded, 0.25, floor))
+
+
 def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
                                 fallback=1.0, H=None):
     """Diagonal preconditioner from |H(target_log_prob)(u_ref)|.
 
-    Returns ``M_diag`` of shape (D,) with ``M_diag[i] = 1 / max(|H_ii|, floor)``.
+    Returns ``M_diag`` of shape (D,) with
+    ``M_diag[i] = 1 / max(|H_ii|, floor_i)`` where ``floor_i`` comes from
+    :func:`_curvature_floors` (bounded coordinates are capped at (π/2)²
+    variance; others at 1/floor).
 
     If ``H`` (a precomputed full Hessian at ``u_ref``) is given, its diagonal
     is reused instead of recomputing; otherwise the Hessian is obtained via
@@ -232,18 +332,21 @@ def _build_diag_hessian_precond(problem_s, u_ref, *, floor=1e-6,
     """
     if H is None:
         H = _full_hessian(problem_s, u_ref)
+    floors = _curvature_floors(problem_s.problem, floor=floor)
     h_diag = jnp.abs(jnp.diag(H))
     h_diag = jnp.where(jnp.isfinite(h_diag), h_diag, fallback)
-    M = 1.0 / jnp.maximum(h_diag, floor)
+    M = 1.0 / jnp.maximum(h_diag, floors)
     return jnp.where(jnp.isfinite(M), M, 1.0)
 
 
 def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6, H=None):
-    """Full Hessian preconditioner ``M = (|H| + reg·I)^{-1}``.
+    """Full Hessian preconditioner ``M = (|H| + diag(floors))^{-1}``.
 
-    Builds an SPD approximation by taking the absolute eigenvalues, so the
+    Builds an SPD approximation by taking the absolute eigenvalues (so the
     preconditioner is well-defined even where the Hessian has saddle-point
-    directions. Returns ``(M, L_chol, L_mass)``:
+    directions), then adds the per-coordinate curvature floors from
+    :func:`_curvature_floors` (capping flat bounded directions at (π/2)²
+    variance) before inverting. Returns ``(M, L_chol, L_mass)``:
 
     - ``M``       : the preconditioner (≈ posterior covariance in u-space);
     - ``L_chol``  : ``L_chol L_chol^T = M`` — SGLD's noise factor;
@@ -255,11 +358,14 @@ def _build_full_hessian_precond(problem_s, u_ref, *, reg=1e-6, H=None):
     """
     if H is None:
         H = _full_hessian(problem_s, u_ref)
+    floors = _curvature_floors(problem_s.problem, floor=reg)
     w, V = jnp.linalg.eigh(0.5 * (H + H.T))
-    w_abs = jnp.maximum(jnp.abs(w), 0.0) + reg
-    M = (V * (1.0 / w_abs)) @ V.T
-    L_chol = (V * (1.0 / jnp.sqrt(w_abs))) @ V.T
-    L_mass = (V * jnp.sqrt(w_abs)) @ V.T
+    A = (V * jnp.maximum(jnp.abs(w), 0.0)) @ V.T + jnp.diag(floors) + reg * jnp.eye(H.shape[0])
+    w2, V2 = jnp.linalg.eigh(0.5 * (A + A.T))
+    w2 = jnp.maximum(w2, reg)
+    M = (V2 * (1.0 / w2)) @ V2.T
+    L_chol = (V2 * (1.0 / jnp.sqrt(w2))) @ V2.T
+    L_mass = (V2 * jnp.sqrt(w2)) @ V2.T
     return M, L_chol, L_mass
 
 
@@ -636,77 +742,103 @@ def _chunk_keys(key, size, n_chains):
     return key, keys
 
 
-def _chunk_nleaps(key, size, n_leapfrog):
-    """Per-iteration trajectory lengths, shared across chains (lockstep)."""
+def _chunk_lkeys(key, size):
+    """Per-iteration keys for the trajectory-length draw (shared across
+    chains — lockstep vmap/pmap requires one L per iteration)."""
     key, sub = jr.split(key)
-    if n_leapfrog <= 1:
-        return key, jnp.ones(size, dtype=jnp.int32)
-    return key, jr.randint(sub, (size,), 1, n_leapfrog + 1)
+    return key, jr.split(sub, size).reshape(size, 2)
+
+
+def _draw_n_leap(key_L, eps, traj_length, n_leap_cap):
+    """Jittered leapfrog count for one iteration: uniform in [1, L_hi] with
+    ``L_hi = clip(ceil(traj_length / eps), 1, n_leap_cap)``.
+
+    Holding the *trajectory length* ``eps·L`` (in preconditioned-σ units)
+    roughly constant is what makes HMC robust to whatever step size dual
+    averaging settles on: when curvature (e.g. a constraint kink) forces eps
+    down, L rises to compensate, so proposals still travel O(1) posterior
+    widths instead of degenerating into a random walk. The uniform jitter
+    avoids periodic-orbit resonances.
+    """
+    L_hi = jnp.clip(jnp.ceil(traj_length / eps).astype(jnp.int32),
+                    1, n_leap_cap)
+    # Jitter over the upper half of [1, L_hi]: enough spread to kill
+    # resonances without wasting half the gradient budget on short hops.
+    L_lo = jnp.maximum(1, L_hi // 2)
+    return jr.randint(key_L, (), L_lo, L_hi + 1)
 
 
 def _make_hmc_chunk_fns(problem_s, kind, precond_obj, n_chains, mu, target,
-                        use_pmap, devices):
+                        traj_length, n_leap_cap, use_pmap, devices):
     """Build jitted (burn_chunk, samp_chunk) for the HMC/MALA kernel.
 
-    burn_chunk(us, logps, gs, da, keys, n_leaps)
-        -> us, logps, gs, da, (eps_hist, alpha_hist, div_hist)
-    samp_chunk(us, logps, gs, eps, keys, n_leaps)
-        -> us, logps, gs, (u_hist, logp_hist, acc_hist, div_hist)
+    burn_chunk(us, logps, gs, da, keys, lkeys)
+        -> us, logps, gs, da, (eps_hist, alpha_hist, div_hist, nl_hist)
+    samp_chunk(us, logps, gs, eps, keys, lkeys)
+        -> us, logps, gs, (u_hist, logp_hist, acc_hist, div_hist, nl_hist)
+
+    The per-iteration leapfrog count is drawn on-device from the *current*
+    eps (see :func:`_draw_n_leap`), shared across chains (lockstep).
     """
     one_step = _make_hmc_one_step(problem_s, kind, precond_obj)
 
     if not use_pmap:
         step_c = vmap(one_step, in_axes=(0, 0, 0, 0, None, None))
 
-        def burn_chunk(us, logps, gs, da, keys, n_leaps):
+        def burn_chunk(us, logps, gs, da, keys, lkeys):
             def body(carry, xs):
                 us, logps, gs, da = carry
-                k, nl = xs
+                k, kl = xs
                 eps = jnp.exp(da[2])
+                nl = _draw_n_leap(kl, eps, traj_length, n_leap_cap)
                 us, logps, gs, aprob, acc, div = step_c(us, logps, gs, k, eps, nl)
                 alpha = jnp.mean(aprob)
                 da = _da_update(da, alpha, mu, target)
-                return (us, logps, gs, da), (eps, alpha, jnp.sum(div))
+                return (us, logps, gs, da), (eps, alpha, jnp.sum(div), nl)
             (us, logps, gs, da), hist = lax.scan(
-                body, (us, logps, gs, da), (keys, n_leaps))
+                body, (us, logps, gs, da), (keys, lkeys))
             return us, logps, gs, da, hist
 
-        def samp_chunk(us, logps, gs, eps, keys, n_leaps):
+        def samp_chunk(us, logps, gs, eps, keys, lkeys):
             def body(carry, xs):
                 us, logps, gs = carry
-                k, nl = xs
+                k, kl = xs
+                nl = _draw_n_leap(kl, eps, traj_length, n_leap_cap)
                 us, logps, gs, aprob, acc, div = step_c(us, logps, gs, k, eps, nl)
-                return (us, logps, gs), (us, logps, acc, div)
+                return (us, logps, gs), (us, logps, acc, div, nl)
             (us, logps, gs), hist = lax.scan(
-                body, (us, logps, gs), (keys, n_leaps))
+                body, (us, logps, gs), (keys, lkeys))
             return us, logps, gs, hist
 
         return jit(burn_chunk), jit(samp_chunk)
 
     # pmap backend: one chain per device, scan inside pmap. Shared quantities
-    # (eps, dual-averaging state) are derived from pmean'd acceptance, so every
-    # device computes identical copies; the host reads device 0.
-    def dev_burn(u, logp, g, da, keys_dev, n_leaps):
+    # (eps, dual-averaging state, the L draw) are derived from pmean'd
+    # acceptance and a broadcast L-key, so every device computes identical
+    # copies; the host reads device 0.
+    def dev_burn(u, logp, g, da, keys_dev, lkeys):
         def body(carry, xs):
             u, logp, g, da = carry
-            k, nl = xs
+            k, kl = xs
             eps = jnp.exp(da[2])
+            nl = _draw_n_leap(kl, eps, traj_length, n_leap_cap)
             u, logp, g, aprob, acc, div = one_step(u, logp, g, k, eps, nl)
             alpha = lax.pmean(aprob, axis_name="chains")
             da = _da_update(da, alpha, mu, target)
             div_tot = lax.psum(div.astype(jnp.int32), axis_name="chains")
-            return (u, logp, g, da), (eps, alpha, div_tot)
+            return (u, logp, g, da), (eps, alpha, div_tot, nl)
         (u, logp, g, da), hist = lax.scan(
-            body, (u, logp, g, da), (keys_dev, n_leaps))
+            body, (u, logp, g, da), (keys_dev, lkeys))
         return u, logp, g, da, hist
 
-    def dev_samp(u, logp, g, eps, keys_dev, n_leaps):
+    def dev_samp(u, logp, g, eps, keys_dev, lkeys):
         def body(carry, xs):
             u, logp, g = carry
-            k, nl = xs
+            k, kl = xs
+            nl = _draw_n_leap(kl, eps, traj_length, n_leap_cap)
             u, logp, g, aprob, acc, div = one_step(u, logp, g, k, eps, nl)
-            return (u, logp, g), (u, logp, acc, div)
-        (u, logp, g), hist = lax.scan(body, (u, logp, g), (keys_dev, n_leaps))
+            return (u, logp, g), (u, logp, acc, div, nl)
+        (u, logp, g), hist = lax.scan(body, (u, logp, g), (keys_dev, lkeys))
         return u, logp, g, hist
 
     burn_p = pmap(dev_burn, axis_name="chains",
@@ -714,21 +846,21 @@ def _make_hmc_chunk_fns(problem_s, kind, precond_obj, n_chains, mu, target,
     samp_p = pmap(dev_samp, axis_name="chains",
                   in_axes=(0, 0, 0, None, 1, None), devices=devices)
 
-    def burn_chunk(us, logps, gs, da, keys, n_leaps):
-        us, logps, gs, da_r, hist = burn_p(us, logps, gs, da, keys, n_leaps)
+    def burn_chunk(us, logps, gs, da, keys, lkeys):
+        us, logps, gs, da_r, hist = burn_p(us, logps, gs, da, keys, lkeys)
         # da_r / eps_hist / alpha_hist replicated across devices; take dev 0.
         da = tuple(v[0] for v in da_r)
-        eps_h, alpha_h, div_h = hist
-        return us, logps, gs, da, (eps_h[0], alpha_h[0], div_h[0])
+        eps_h, alpha_h, div_h, nl_h = hist
+        return us, logps, gs, da, (eps_h[0], alpha_h[0], div_h[0], nl_h[0])
 
-    def samp_chunk(us, logps, gs, eps, keys, n_leaps):
-        us, logps, gs, hist = samp_p(us, logps, gs, eps, keys, n_leaps)
-        u_h, logp_h, acc_h, div_h = hist          # (nc, size, ...) — chain-major
+    def samp_chunk(us, logps, gs, eps, keys, lkeys):
+        us, logps, gs, hist = samp_p(us, logps, gs, eps, keys, lkeys)
+        u_h, logp_h, acc_h, div_h, nl_h = hist    # (nc, size, ...) — chain-major
         return us, logps, gs, (jnp.moveaxis(u_h, 0, 1),
                                jnp.moveaxis(logp_h, 0, 1),
                                jnp.moveaxis(acc_h, 0, 1),
-                               jnp.moveaxis(div_h, 0, 1))
-
+                               jnp.moveaxis(div_h, 0, 1),
+                               nl_h[0])
     return burn_chunk, samp_chunk
 
 
@@ -857,7 +989,7 @@ def run_mcmc_posterior(problem, u_map, *,
                        n_samples=1000, n_chains=4,
                        burn_in=None, thin=1, perturb_scale=1.0,
                        step_size=None, adapt_step=True, adapt_target=None,
-                       n_leapfrog=16,
+                       traj_length=None, n_leapfrog=64,
                        precond="diag_hessian",
                        seed=0, progress=False,
                        polish_map=False, polish_max_iter=200,
@@ -899,10 +1031,16 @@ def run_mcmc_posterior(problem, u_map, *,
     adapt_target : float or None
         Target acceptance rate (hmc: 0.8, mala: 0.574) or drift/noise ratio
         (sgld: 0.3). None picks the kernel default.
+    traj_length : float or None
+        hmc: target trajectory length ``eps·L`` in preconditioned-σ units
+        (default 1.5 ≈ π/2, the decorrelation scale of a unit Gaussian).
+        Each iteration draws L uniformly in [1, clip(ceil(traj_length/eps),
+        1, n_leapfrog)] — when curvature forces eps down, L rises to
+        compensate, so proposals keep travelling O(1) posterior widths.
+        Ignored for mala (L=1) and sgld.
     n_leapfrog : int
-        Max leapfrog steps per HMC iteration; the actual length is drawn
-        uniformly in [1, n_leapfrog] each iteration (jitter avoids
-        resonances). Ignored for mala (=1) and sgld.
+        hmc: hard cap on leapfrog steps per iteration (cost/memory guard on
+        the traj_length rule above).
     precond : {"diag_hessian", "full_hessian", "rmsprop", "identity"}
         Mass-matrix preconditioner, built once at the init point.
         - ``diag_hessian`` (recommended default): inverse |diag(H)|.
@@ -933,11 +1071,23 @@ def run_mcmc_posterior(problem, u_map, *,
         burn_in = n_samples
     if adapt_target is None:
         adapt_target = {"hmc": 0.8, "mala": 0.574, "sgld": 0.3}[kernel]
+    elif kernel in ("hmc", "mala") and adapt_target < 0.4:
+        # Old SGLD decks carry adapt_target ≈ 0.3 (a drift/noise ratio); for
+        # the Metropolis kernels the same key is an acceptance-rate target,
+        # where 0.3 is a poor choice. Likely a stale deck setting.
+        print(f"  [sampling] WARNING: adapt_target={adapt_target} with "
+              f"kernel={kernel!r} targets a {adapt_target:.0%} acceptance "
+              f"rate — this looks like an SGLD-era drift/noise setting. "
+              f"Remove adapt_target from the deck to use the {kernel} "
+              f"default ({0.8 if kernel == 'hmc' else 0.574}).")
     if step_size is None:
         step_size = 0.1 if kernel == "sgld" else 0.5
     if kernel == "mala":
         n_leapfrog = 1
     n_leapfrog = max(1, int(n_leapfrog))
+    if traj_length is None:
+        traj_length = 1.5
+    traj_length = float(traj_length)
     if kernel in ("hmc", "mala") and precond == "rmsprop":
         raise ValueError(
             "precond='rmsprop' is only supported with kernel='sgld' "
@@ -946,7 +1096,9 @@ def run_mcmc_posterior(problem, u_map, *,
         )
 
     problem_s = build_sampling_problem(problem, temperature=temperature)
-    u_map = jnp.asarray(u_map, dtype=jnp.float64)
+    # Convert the fit-space (arcsin) MAP into the sampler's coordinates
+    # (logistic for two-sided bounds — see _make_sampling_bijector).
+    u_map = jnp.asarray(problem_s.u_from_fit(u_map), dtype=jnp.float64)
     D = int(u_map.shape[0])
 
     # Optionally polish to the Jacobian-corrected mode.
@@ -1023,11 +1175,12 @@ def run_mcmc_posterior(problem, u_map, *,
     eps_history = np.zeros(burn_in, dtype=np.float64)
     n_divergent_burn = 0
 
+    avg_leapfrog = 0.0
     if kernel in ("hmc", "mala"):
         mu_da = float(np.log(10.0 * step_size))
         burn_chunk, samp_chunk = _make_hmc_chunk_fns(
             problem_s, kind, precond_obj, n_chains, mu_da, adapt_target,
-            use_chain_pmap, chain_devices)
+            traj_length, n_leapfrog, use_chain_pmap, chain_devices)
 
         # Initial (logp, grad) at the chain states — carried thereafter, so
         # each HMC iteration costs exactly n_leap gradient evaluations.
@@ -1043,25 +1196,28 @@ def run_mcmc_posterior(problem, u_map, *,
 
         # ── burn-in ──
         off = 0
+        nl_sum = 0.0
         for size in _split_chunks(burn_in, chunk_size):
             key, keys = _chunk_keys(key, size, n_chains)
-            key, nls = _chunk_nleaps(key, size, n_leapfrog)
+            key, lkeys = _chunk_lkeys(key, size)
             if adapt_step:
-                us, logps, gs, da, (eps_h, alpha_h, div_h) = burn_chunk(
-                    us, logps, gs, da, keys, nls)
+                us, logps, gs, da, (eps_h, alpha_h, div_h, nl_h) = burn_chunk(
+                    us, logps, gs, da, keys, lkeys)
             else:
                 eps_fix = jnp.asarray(step_size)
-                us, logps, gs, (u_h, lp_h, acc_h, div_h) = samp_chunk(
-                    us, logps, gs, eps_fix, keys, nls)
+                us, logps, gs, (u_h, lp_h, acc_h, div_h, nl_h) = samp_chunk(
+                    us, logps, gs, eps_fix, keys, lkeys)
                 eps_h = jnp.full(size, step_size)
                 alpha_h = jnp.mean(acc_h, axis=1)
             eps_history[off:off + size] = np.asarray(eps_h)
             n_divergent_burn += int(np.sum(np.asarray(div_h)))
+            nl_sum += float(np.sum(np.asarray(nl_h)))
             off += size
             if bar is not None:
                 bar.update(size)
                 bar.set_postfix({"step_size": f"{float(eps_h[-1]):.2e}",
-                                 "accept": f"{float(alpha_h[-1]):.2f}"})
+                                 "accept": f"{float(alpha_h[-1]):.2f}",
+                                 "L": f"{float(nl_h[-1]):.0f}"})
 
         eps = float(np.exp(np.asarray(da[3]))) if adapt_step else float(step_size)
 
@@ -1078,12 +1234,13 @@ def run_mcmc_posterior(problem, u_map, *,
         eps_j = jnp.asarray(eps)
         for size in _split_chunks(n_iter_sample, chunk_size):
             key, keys = _chunk_keys(key, size, n_chains)
-            key, nls = _chunk_nleaps(key, size, n_leapfrog)
-            us, logps, gs, (u_h, lp_h, acc_h, div_h) = samp_chunk(
-                us, logps, gs, eps_j, keys, nls)
+            key, lkeys = _chunk_lkeys(key, size)
+            us, logps, gs, (u_h, lp_h, acc_h, div_h, nl_h) = samp_chunk(
+                us, logps, gs, eps_j, keys, lkeys)
             u_h, lp_h = np.asarray(u_h), np.asarray(lp_h)      # (size, nc, ...)
             acc_all.append(np.asarray(acc_h))
             n_divergent_samp += int(np.sum(np.asarray(div_h)))
+            nl_sum += float(np.sum(np.asarray(nl_h)))
             # keep iterations where (global_it + 1) % thin == 0
             its = np.arange(it_global, it_global + size)
             sel = np.nonzero((its + 1) % thin == 0)[0]
@@ -1097,6 +1254,7 @@ def run_mcmc_posterior(problem, u_map, *,
         accept_rate = (np.concatenate(acc_all, axis=0).mean(axis=0)
                        if acc_all else np.full(n_chains, np.nan))
         n_divergent = n_divergent_burn + n_divergent_samp
+        avg_leapfrog = nl_sum / max(1, burn_in + n_iter_sample)
 
     else:  # ── legacy SGLD ──
         burn_chunk, samp_chunk = _make_sgld_chunk_fns(
@@ -1226,6 +1384,8 @@ def run_mcmc_posterior(problem, u_map, *,
         accept_rate=accept_rate,
         n_divergent=n_divergent,
         n_leapfrog=(n_leapfrog if kernel in ("hmc", "mala") else 0),
+        traj_length=(traj_length if kernel == "hmc" else 0.0),
+        avg_leapfrog=avg_leapfrog,
         adapt_target=adapt_target,
         n_chains=n_chains,
         n_samples=n_samples,
@@ -1267,7 +1427,8 @@ def run_laplace_posterior(problem, u_map, *,
     chain-specific fields are ``None``).
     """
     problem_s = build_sampling_problem(problem, temperature=temperature)
-    u_map = jnp.asarray(u_map, dtype=jnp.float64)
+    # Fit-space (arcsin) MAP → sampler coordinates (logistic for two-sided).
+    u_map = jnp.asarray(problem_s.u_from_fit(u_map), dtype=jnp.float64)
 
     if polish_map:
         u_ref = _polish_map(problem_s, u_map, max_iter=polish_max_iter)

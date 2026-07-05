@@ -459,6 +459,7 @@ def _run_sampling_phase(Pkl_data, Pkl_var, meas, pen, pars, extras, constraints,
         acc = np.asarray(samp.accept_rate)
         print(f"  accept rate = {np.nanmean(acc):.2f} "
               f"(per chain: {', '.join(f'{a:.2f}' for a in acc)}) | "
+              f"avg leapfrog = {samp.avg_leapfrog:.1f} | "
               f"divergences = {samp.n_divergent}")
         if samp.n_divergent > 0:
             print("  WARNING: divergent trajectories detected; error bars may "

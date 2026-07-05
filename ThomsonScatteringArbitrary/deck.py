@@ -646,6 +646,8 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
         summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
         if getattr(samp, "kernel", "sgld") in ("hmc", "mala"):
             summary.attrs["n_leapfrog"]   = int(samp.n_leapfrog)
+            summary.attrs["traj_length"]  = float(getattr(samp, "traj_length", 0.0))
+            summary.attrs["avg_leapfrog"] = float(getattr(samp, "avg_leapfrog", 0.0))
             summary.attrs["accept_rate"]  = _np.asarray(samp.accept_rate)
             summary.attrs["n_divergent"]  = int(samp.n_divergent)
 
