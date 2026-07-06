@@ -293,26 +293,47 @@ def _ylabel_for_key(key):
 
 
 def _plot_profiles_generic(profiles, time_axis, png_path, shot_num, profile_vars):
-    """Plot an arbitrary list of profile keys, auto-laid-out up to 4 per row."""
+    """Plot profile keys, one axis per group, auto-laid-out up to 3 per row.
+
+    ``profile_vars`` may be a flat list of keys (one key per axis) or a nested
+    list where each inner list is drawn together on its own axis with a legend::
+
+        [["Ti0", "Ti1", "Ti2"],
+         ["ui0", "ui1", "ui2"],
+         ["ifract0", "ifract1", "ifract2", "ifract3", "ifract4", "ifract5"]]
+
+    puts the temperatures on one axis, the velocities on the next, and all the
+    ion fractions on the third. A bare string is treated as a one-key group, so
+    a flat list keeps its previous one-key-per-axis behaviour.
+    """
     import math as _math
-    n_vars = len(profile_vars)
-    if n_vars == 0:
+    groups = [list(g) if isinstance(g, (list, tuple)) else [g]
+              for g in profile_vars]
+    n_groups = len(groups)
+    if n_groups == 0:
         return
-    ncols = min(3, n_vars)
-    nrows = _math.ceil(n_vars / ncols)
+    ncols = min(3, n_groups)
+    nrows = _math.ceil(n_groups / ncols)
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols,
                              figsize=(4.5 * ncols, 3.5 * nrows), squeeze=False)
-    for idx, key in enumerate(profile_vars):
+    for idx, group in enumerate(groups):
         ax = axes[idx // ncols][idx % ncols]
-        if key in profiles:
-            ax.plot(time_axis, profiles[key])
-        else:
-            ax.text(0.5, 0.5, f"'{key}' not in results",
+        present = [key for key in group if key in profiles]
+        for key in present:
+            ax.plot(time_axis, profiles[key], label=key)
+        if not present:
+            missing = ", ".join(f"'{k}'" for k in group)
+            ax.text(0.5, 0.5, f"{missing} not in results",
                     ha="center", va="center", transform=ax.transAxes, color="gray")
         ax.set_xlabel("Time [ns]")
-        ax.set_ylabel(_ylabel_for_key(key))
-        ax.set_title(key)
-    for idx in range(n_vars, nrows * ncols):
+        ax.set_ylabel(_ylabel_for_key(group[0]))
+        # Title: the shared base (e.g. "Ti") when the group has one, else the
+        # comma-joined key list.
+        bases = {key.rstrip("0123456789") for key in group}
+        ax.set_title(next(iter(bases)) if len(bases) == 1 else ", ".join(group))
+        if len(present) > 1:
+            ax.legend(fontsize=7)
+    for idx in range(n_groups, nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
     fig.suptitle(f"Shot {shot_num} fitted profiles")
     fig.tight_layout()
