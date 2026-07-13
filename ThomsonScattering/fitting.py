@@ -1,15 +1,27 @@
 """Differentiable Thomson-scattering fit on time-resolved streaks.
 
+Port of the original ThomsonScattering.fitting generalized to per-species
+distribution models: each electron/ion species carries a
+:class:`~.distributions.Distribution`, and its shape parameters (e.g. the
+super-Gaussian exponent ``p`` → prefixes ``pe0`` / ``pi0``, a kappa index
+``kappa`` → ``kappae0`` / ``kappai0``) join the universal moment parameters
+(``n``, ``Te``/``ue``/``efract``, ``Ti``/``ui``/``ifract``) in the fit vector.
+
 Public entry points:
 
 - :class:`Param`      — tiny dataclass holding ``(value, min, max, vary)``.
-- :func:`build_params` — assemble a ``{name: Param}`` dict for a given
-  ``(Nelectrons, Nions, Nt)`` problem, with the three-level specificity
-  override pattern used throughout the package.
+- :func:`build_params` — assemble a ``{name: Param}`` dict for given
+  per-species models, with the three-level specificity override pattern.
 - :func:`run_fit_grad` — run a JAX + optax fit on a time-resolved Thomson
   streak. Returns ``(result, best_fit)``.
 - :func:`compute_initial_fit` — evaluate the forward model at the initial
   guess (no fitting). Useful for diagnostic plots.
+
+Models are chosen via ``measurement_settings["e_models"]`` /
+``["i_models"]`` (lists of model specs — see
+:func:`~.distributions.resolve_distribution`); both default to
+``"super_gaussian"`` per species, which reproduces the original package's
+parameters and results exactly.
 """
 import math
 from collections import deque
@@ -28,6 +40,7 @@ from jax import jit, value_and_grad
 from scipy.constants import k as kB, e
 
 from .arrays import extract_params_as_array
+from .distributions import resolve_models, shape_param_prefix
 from .forward import scattered_power_wavelength
 
 
@@ -86,10 +99,28 @@ def _tikhonov_penalty(param_array, profile_axis, lambda_weights, thresholds,
 
 # ─── constraint compilation ──────────────────────────────────────────────────
 
+def _smax(a, b, w=0.01):
+    """Smooth max: ``w·logaddexp(a/w, b/w)`` → max(a, b) as w → 0.
+
+    Drop-in replacement for ``max(a, b)`` in constraint expressions when the
+    result is sampled: the hard max has a gradient kink that stalls the
+    HMC/MALA kernels (leapfrog energy errors at the kink force the step size
+    down), while ``smax`` is C^∞ with a transition region of width ~w.
+    Choose ``w`` small against the scale of ``a - b`` near the fit.
+    """
+    return w * jnp.logaddexp(a / w, b / w)
+
+
+def _smin(a, b, w=0.01):
+    """Smooth min: ``-smax(-a, -b, w)``."""
+    return -_smax(-a, -b, w)
+
+
 # Namespace exposed to constraint expressions. `min` / `max` are the binary
 # jnp variants — matches the 2-arg form documented in the deck schema.
 _CONSTRAINT_NS = {
     "min": jnp.minimum, "max": jnp.maximum,
+    "smin": _smin, "smax": _smax,
     "abs": jnp.abs, "where": jnp.where, "clip": jnp.clip,
     "sqrt": jnp.sqrt, "exp": jnp.exp, "log": jnp.log,
     "__builtins__": {},
@@ -121,13 +152,36 @@ def _compile_grad_constraints(constraints):
     return compiled
 
 
+# ─── prefix enumeration ──────────────────────────────────────────────────────
+
+def _species_prefix_bases(e_models, i_models):
+    """Per-species parameter bases as ``[(base, species_idx)]`` lists.
+
+    Universal moment bases plus each model's shape-parameter bases. The base
+    for shape param ``q`` is ``q + kind`` (e.g. ``"pe"``), so the full prefix
+    ``f"{base}{s}"`` matches the original package's naming for super-Gaussians.
+    """
+    out = []
+    for s, m in enumerate(e_models):
+        for b in ("Te", "ue", "efract"):
+            out.append((b, s))
+        for q in m.shape_param_names:
+            out.append((f"{q}e", s))
+    for s, m in enumerate(i_models):
+        for b in ("Ti", "ui", "ifract"):
+            out.append((b, s))
+        for q in m.shape_param_names:
+            out.append((f"{q}i", s))
+    return out
+
+
 # ─── parameter building ──────────────────────────────────────────────────────
 
-def build_params(Nelectrons, Nions, Nt, params_settings=None, background_order=None):
+def build_params(e_models, i_models, Nt, params_settings=None, background_order=None):
     """Build a ``{name: Param}`` dict with the package's naming scheme.
 
-    Parameters are keyed ``<var><species>_<time>`` (e.g. ``Te0_3``, ``Ti1_0``);
-    the per-shot density ``n_<time>`` has no species index.
+    Parameters are keyed ``<var><species>_<time>`` (e.g. ``Te0_3``, ``pi1_0``,
+    ``kappae0_2``); the per-shot density ``n_<time>`` has no species index.
 
     ``params_settings`` is a ``dict[str, dict]`` mapping parameter keys to
     Param-constructor kwargs (``value``, ``min``, ``max``, ``vary``). Keys use
@@ -138,6 +192,9 @@ def build_params(Nelectrons, Nions, Nt, params_settings=None, background_order=N
     - global:                ``"Te"``     → all Te species at all times
 
     For ``n`` (no species index) the lookup checks ``"n_<t>"`` then ``"n"``.
+
+    Shape parameters take their defaults (value/min/max) from the model's
+    ``shape_param_defaults``; deck entries override as usual.
 
     If ``background_order`` is not None, polynomial background coefficients
     ``bg<i>_<t>`` for ``i in range(background_order + 1)`` are added.
@@ -169,19 +226,23 @@ def build_params(Nelectrons, Nions, Nt, params_settings=None, background_order=N
     for t in range(Nt):
         p[f"n_{t}"] = Param(**_lookup("n", None, t, {"value": 1e20}))
 
-    for s in range(Nelectrons):
-        for t in range(Nt):
-            p[f"Te{s}_{t}"]     = Param(**_lookup("Te",     s, t, {"value": 100.0}))
-            p[f"ue{s}_{t}"]     = Param(**_lookup("ue",     s, t, {"value": 0.0}))
-            p[f"pe{s}_{t}"]     = Param(**_lookup("pe",     s, t, {"value": 2.0}))
-            p[f"efract{s}_{t}"] = Param(**_lookup("efract", s, t, {"value": 1.0}))
+    _moment_defaults = {
+        "Te": {"value": 100.0}, "ue": {"value": 0.0}, "efract": {"value": 1.0},
+        "Ti": {"value": 100.0}, "ui": {"value": 0.0}, "ifract": {"value": 1.0},
+    }
 
-    for s in range(Nions):
-        for t in range(Nt):
-            p[f"Ti{s}_{t}"]     = Param(**_lookup("Ti",     s, t, {"value": 100.0}))
-            p[f"ui{s}_{t}"]     = Param(**_lookup("ui",     s, t, {"value": 0.0}))
-            p[f"pi{s}_{t}"]     = Param(**_lookup("pi",     s, t, {"value": 2.0}))
-            p[f"ifract{s}_{t}"] = Param(**_lookup("ifract", s, t, {"value": 1.0}))
+    for kind, models in (("e", e_models), ("i", i_models)):
+        for s, model in enumerate(models):
+            bases = ("Te", "ue", "efract") if kind == "e" else ("Ti", "ui", "ifract")
+            for t in range(Nt):
+                for b in bases:
+                    p[f"{b}{s}_{t}"] = Param(**_lookup(b, s, t, _moment_defaults[b]))
+                for q in model.shape_param_names:
+                    default = dict(model.shape_param_defaults.get(q, {"value": 0.0}))
+                    if "value" not in default:
+                        default["value"] = 0.0
+                    base = f"{q}{kind}"
+                    p[f"{base}{s}_{t}"] = Param(**_lookup(base, s, t, default))
 
     if background_order is not None:
         for i in range(background_order + 1):
@@ -214,46 +275,56 @@ def _expand_extra_params(params, extra_params, Nt):
     return prefixes
 
 
-# ─── forward-model call (shared by run_fit_grad and compute_initial_fit) ─────
+# ─── forward-model call ──────────────────────────────────────────────────────
 
-_jitted_scattered_power_wavelength = jit(
-    scattered_power_wavelength,
-    static_argnames=("normalization_type", "notch", "irf_normalization", "gain_mode"),
-)
+def _make_forward_fn(measurement_settings, e_models, i_models):
+    """Build the package-unit forward call closing over models + settings.
 
+    Returns ``fwd(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+    instr_func_arr)`` where ``n`` is in cm^-3 and ``Te``/``Ti`` in eV
+    (converted to m^-3 and K inside). ``instr_func_arr`` is explicit so the
+    time-sharded path can substitute its per-shard slice; pass
+    ``measurement_settings.get("instr_func_arr")`` for the plain path.
 
-def _call_forward(n, Te, ue, pe, efract, Ti, ui, pi, ifract, bg, ms):
-    """Invoke the JIT-wrapped forward model with package unit conventions.
-
-    ``n`` is in cm^-3, ``Te`` / ``Ti`` in eV; converted to m^-3 and K inside.
+    The models are closed over (they are static Python objects); jit the
+    returned function at the call site.
     """
-    return _jitted_scattered_power_wavelength(
-        n=n * 1e6,
-        ue=ue, ui=ui,
-        Te=Te * e / kB, Ti=Ti * e / kB,
-        pe=pe, pi=pi,
-        efract=efract, ifract=ifract,
-        ion_z=ms["ion_z"],
-        ion_a=ms["ion_a"],
-        wavelengths=ms["wavelengths"],
-        probe_wavelength=ms["probe_wavelength"],
-        probe_vec=ms["probe_vec"],
-        scatter_vec=ms["scatter_vec"],
-        ue_dir=ms["ue_dir"],
-        ui_dir=ms["ui_dir"],
-        instr_func_arr=ms.get("instr_func_arr", None),
-        irf_normalization=ms.get("irf_normalization", "area"),
-        throughput=ms.get("throughput", None),
-        aperture_weights=ms.get("aperture_weights", None),
-        background_coefs=bg,
-        normalization_type=ms.get("normalization_type", "max"),
-        normalization_scale=ms.get("normalization_scale", 1),
-        notch=ms.get("notch", None),
-        probe_intensity=ms.get("probe_intensity", 0.0),
-        probe_diameter=ms.get("probe_diameter", 1.0),
-        pol_p_fraction=ms.get("pol_p_fraction", 1.0),
-        gain_mode=ms.get("gain_mode", "off"),
-    )
+    ms = measurement_settings
+
+    def fwd(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+            instr_func_arr):
+        return scattered_power_wavelength(
+            n=n * 1e6,
+            ue=ue, ui=ui,
+            Te=Te * e / kB, Ti=Ti * e / kB,
+            efract=efract, ifract=ifract,
+            ion_z=ms["ion_z"],
+            ion_a=ms["ion_a"],
+            wavelengths=ms["wavelengths"],
+            probe_wavelength=ms["probe_wavelength"],
+            probe_vec=ms["probe_vec"],
+            scatter_vec=ms["scatter_vec"],
+            ue_dir=ms["ue_dir"],
+            ui_dir=ms["ui_dir"],
+            e_models=e_models,
+            i_models=i_models,
+            e_shapes=e_shapes,
+            i_shapes=i_shapes,
+            instr_func_arr=instr_func_arr,
+            irf_normalization=ms.get("irf_normalization", "area"),
+            throughput=ms.get("throughput", None),
+            aperture_weights=ms.get("aperture_weights", None),
+            background_coefs=bg,
+            normalization_type=ms.get("normalization_type", "max"),
+            normalization_scale=ms.get("normalization_scale", 1),
+            notch=ms.get("notch", None),
+            probe_intensity=ms.get("probe_intensity", 0.0),
+            probe_diameter=ms.get("probe_diameter", 1.0),
+            pol_p_fraction=ms.get("pol_p_fraction", 1.0),
+            gain_mode=ms.get("gain_mode", "off"),
+        )
+
+    return fwd
 
 
 # ─── data-fidelity term ─────────────────────────────────────────────────────
@@ -272,30 +343,30 @@ def _log_likelihood(fit, data, variance):
 # ─── time-axis sharding (intra-fit CPU parallelism) ──────────────────────────
 
 def _pad_time_axis(moments, pad):
-    """Pad each moment array's time axis (the last axis) by ``pad``, edge mode.
+    """Pad each moment leaf's time axis (the last axis) by ``pad``, edge mode.
 
-    ``None`` entries (e.g. absent background) pass through. Edge padding repeats
-    the last real time column so the forward model stays finite on the padded
-    columns; those columns carry NaN data and are masked out of the loss, and
-    ``jnp.pad``'s VJP discards their gradients, so the real columns are
-    unaffected.
+    ``moments`` is a pytree (the forward-args tuple, including the nested
+    ``e_shapes`` / ``i_shapes``); ``None`` entries (e.g. absent background)
+    pass through. Edge padding repeats the last real time column so the
+    forward model stays finite on the padded columns; those columns carry NaN
+    data and are masked out of the loss, and ``jnp.pad``'s VJP discards their
+    gradients, so the real columns are unaffected.
     """
     if pad == 0:
-        return tuple(moments)
-    out = []
-    for a in moments:
-        if a is None:
-            out.append(None)
-        elif jnp.ndim(a) == 1:
-            out.append(jnp.pad(a, (0, pad), mode="edge"))
-        else:
-            out.append(jnp.pad(a, ((0, 0), (0, pad)), mode="edge"))
-    return tuple(out)
+        return moments
+
+    def _pad(a):
+        if jnp.ndim(a) == 1:
+            return jnp.pad(a, (0, pad), mode="edge")
+        return jnp.pad(a, ((0, 0), (0, pad)), mode="edge")
+
+    return _jax.tree.map(_pad, moments)
 
 
-def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg):
+def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev,
+                      has_bg, e_models, i_models):
     """Time-sharded data-fidelity term, fp-identical to
-    ``_log_likelihood(_call_forward(...), Pkl_data, Pkl_var)``.
+    ``_log_likelihood(fwd(...), Pkl_data, Pkl_var)``.
 
     The forward model is independent per time slice (the only cross-time
     coupling, the Tikhonov penalty, lives outside this term), so the Nt axis is
@@ -309,7 +380,7 @@ def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg
     The per-time instrument-response array ``instr_func_arr`` (Nk, Nt) must be
     sharded along time too — otherwise the forward's per-time IRF conv vmap sees
     a full-Nt IRF against an Nt-block spectrum and errors. We pad+shard it and
-    substitute the per-shard slice into a per-shard copy of measurement_settings.
+    pass the per-shard slice through the forward's explicit IRF argument.
     """
     from jax.sharding import Mesh, PartitionSpec as P
     try:
@@ -333,16 +404,20 @@ def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg
     else:
         irf_p = jnp.zeros((1, Nt_pad), dtype=jnp.float64)
 
+    fwd = _make_forward_fn(measurement_settings, e_models, i_models)
+
     PT, PST = P("t"), P(None, "t")          # (Nt,) and (·, Nt) arrays
-    moment_specs = (PT,) + (PST,) * 8        # n + 8 (species, Nt) moment arrays
+    e_shape_specs = tuple(tuple(PT for _ in m.shape_param_names) for m in e_models)
+    i_shape_specs = tuple(tuple(PT for _ in m.shape_param_names) for m in i_models)
+    # n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract
+    moment_specs = (PT, PST, PST, e_shape_specs, PST,
+                    PST, PST, i_shape_specs, PST)
 
-    def _fwd(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local):
-        ms = ({**measurement_settings, "instr_func_arr": irf_local}
-              if has_time_irf else measurement_settings)
-        return _call_forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, ms)
-
-    def _core(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local, data, var):
-        fit = _fwd(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg, irf_local)
+    def _core(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+              irf_local, data, var):
+        fit = fwd(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+                  irf_local if has_time_irf
+                  else measurement_settings.get("instr_func_arr", None))
         mask   = jnp.isnan(data) | jnp.isnan(fit)
         fit_s  = jnp.where(mask, 0.0, fit)
         data_s = jnp.where(mask, 0.0, data)
@@ -357,23 +432,24 @@ def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg
                             in_specs=moment_specs + (PST, PST, PST, PST),  # bg, irf, data, var
                             out_specs=(P(), P()))
 
-        def sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
+        def sharded_nll(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg):
             m = _pad_time_axis(
-                (n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg), pad)
+                (n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg), pad)
             sse, cnt = mapped(*m, irf_p, data_p, var_p)
             return sse / cnt
     else:
-        def _core_nobg(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, irf_local, data, var):
-            return _core(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, None,
-                         irf_local, data, var)
+        def _core_nobg(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract,
+                       irf_local, data, var):
+            return _core(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract,
+                         None, irf_local, data, var)
 
         mapped = _shard_map(_core_nobg, mesh=mesh,
                             in_specs=moment_specs + (PST, PST, PST),  # irf, data, var
                             out_specs=(P(), P()))
 
-        def sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
+        def sharded_nll(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg):
             m = _pad_time_axis(
-                (n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract), pad)
+                (n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract), pad)
             sse, cnt = mapped(*m, irf_p, data_p, var_p)
             return sse / cnt
 
@@ -382,27 +458,26 @@ def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg
 
 # ─── grad-problem assembly ──────────────────────────────────────────────────
 
-def _build_penalty_list(penalty_settings, Nelectrons, Nions, background_order):
-    """Return ``list[(base, species_or_None, pset)]`` matched against prefixes.
+def _build_penalty_list(penalty_settings, e_models, i_models, background_order):
+    """Return ``list[(prefix, pset)]`` matched against parameter prefixes.
 
     Most-specific match wins (``Te0`` before ``Te``); ``n`` has no species idx.
     The for-loop is unrolled by jit at trace time, so penalty selection is free.
     """
     if penalty_settings is None:
         return []
-    bg_block = ([("bg", background_order + 1)]
-                if background_order is not None else [])
+    pairs = [("n", None)]
+    if background_order is not None:
+        pairs += [("bg", i) for i in range(background_order + 1)]
+    pairs += _species_prefix_bases(e_models, i_models)
     out = []
-    for base, n_sp in ([("n", 1)] + bg_block
-                       + [(b, Nelectrons) for b in ("Te", "ue", "pe", "efract")]
-                       + [(b, Nions)      for b in ("Ti", "ui", "pi", "ifract")]):
-        for s in range(n_sp):
-            prefix = base if base == "n" else f"{base}{s}"
-            pset = penalty_settings.get(prefix)
-            if pset is None:
-                pset = penalty_settings.get(base)
-            if pset is not None:
-                out.append((base, None if base == "n" else s, pset))
+    for base, s in pairs:
+        prefix = base if s is None else f"{base}{s}"
+        pset = penalty_settings.get(prefix)
+        if pset is None:
+            pset = penalty_settings.get(base)
+        if pset is not None:
+            out.append((prefix, pset))
     return out
 
 
@@ -487,7 +562,7 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
     """Set up the differentiable Thomson-fit problem in unconstrained space.
 
     Returns a SimpleNamespace bundling every closure and metadatum that
-    ``run_fit_grad`` (and future posterior samplers) need.
+    ``run_fit_grad`` (and the posterior sampler) need.
 
     ``shard_time`` controls intra-fit time-axis sharding of the data-fidelity
     forward+grad: ``None`` (default) shards when the host exposes >1 XLA device,
@@ -495,15 +570,16 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
     ``False`` because the per-chain ``vmap`` does not compose cleanly with the
     ``shard_map`` inside the objective.
     """
-    Nelectrons = measurement_settings["Nelectrons"]
-    Nions = len(measurement_settings["ion_z"])
+    e_models, i_models = resolve_models(measurement_settings)
+    Nelectrons = len(e_models)
+    Nions = len(i_models)
     Nt = jnp.shape(Pkl_data)[1]
     background_order = measurement_settings.get("background_order", None)
 
     Pkl_data = jnp.array(Pkl_data)
     Pkl_var = jnp.array(Pkl_var)
 
-    params = build_params(Nelectrons, Nions, Nt, params_settings,
+    params = build_params(e_models, i_models, Nt, params_settings,
                           background_order=background_order)
     _extra_prefixes = _expand_extra_params(params, extra_params, Nt)
     _constraints = _compile_grad_constraints(constraints) if constraints else {}
@@ -535,13 +611,8 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
                    for i in range(len(x0_np))], dtype=np.float64)
 
     penalty_list = _build_penalty_list(
-        penalty_settings, Nelectrons, Nions, background_order
+        penalty_settings, e_models, i_models, background_order
     )
-
-    def _get(x, key):
-        if key in key_to_idx:
-            return x[key_to_idx[key]]
-        return jnp.array(fixed_vals[key])
 
     # Precompute per-prefix gather tables so _unpack / _build_params_dict can
     # assemble (Nt,) arrays in a single XLA gather + where instead of a Python
@@ -561,11 +632,9 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
                 fxd[t] = fixed_vals[key]
         return jnp.asarray(idx), jnp.asarray(fxd), jnp.asarray(free)
 
+    _species_bases = _species_prefix_bases(e_models, i_models)
     _all_prefixes = list(_extra_prefixes) + ["n"]
-    for _s in range(Nelectrons):
-        _all_prefixes.extend([f"Te{_s}", f"ue{_s}", f"pe{_s}", f"efract{_s}"])
-    for _s in range(Nions):
-        _all_prefixes.extend([f"Ti{_s}", f"ui{_s}", f"pi{_s}", f"ifract{_s}"])
+    _all_prefixes.extend(f"{base}{s}" for base, s in _species_bases)
     if background_order is not None:
         for _i in range(background_order + 1):
             _all_prefixes.append(f"bg{_i}")
@@ -579,66 +648,65 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
         idx_arr, fixed_arr, is_free = gather_tables[prefix]
         return jnp.where(is_free, x[idx_arr], fixed_arr)
 
-    def _unpack(x):
-        # p accumulates {prefix: (Nt,) array} so constraints can reference
-        # previously assembled prefixes by name.
-        p = {}
-
-        # Extras first: constraints may reference them by their bare name.
-        for extra_prefix in _extra_prefixes:
-            p[extra_prefix] = _gather_prefix(x, extra_prefix)
-
-        def _row(base, s):
-            prefix = base if base == "n" else f"{base}{s}"
-            if prefix in _constraints:
-                arr = _constraints[prefix](p)
-            else:
-                arr = _gather_prefix(x, prefix)
-            p[prefix] = arr
-            return arr
-
-        n      = _row("n", None)
-        Te     = jnp.stack([_row("Te",     s) for s in range(Nelectrons)])
-        ue     = jnp.stack([_row("ue",     s) for s in range(Nelectrons)])
-        pe     = jnp.stack([_row("pe",     s) for s in range(Nelectrons)])
-        efract = jnp.stack([_row("efract", s) for s in range(Nelectrons)])
-        Ti     = jnp.stack([_row("Ti",     s) for s in range(Nions)])
-        ui     = jnp.stack([_row("ui",     s) for s in range(Nions)])
-        pi_arr = jnp.stack([_row("pi",     s) for s in range(Nions)])
-        ifract = jnp.stack([_row("ifract", s) for s in range(Nions)])
-        bg = (jnp.stack([_row("bg", i) for i in range(background_order + 1)])
-              if background_order is not None else None)
-        return n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg
-
     def _build_params_dict(x):
-        """{prefix: (Nt,) array} for every parameter (free, fixed, constrained, extra)."""
+        """{prefix: (Nt,) array} for every parameter (free, fixed, constrained, extra).
+
+        Extras are assembled first so constraints can reference them by name;
+        thereafter prefixes are filled in declaration order, with constrained
+        prefixes evaluated against everything accumulated so far.
+        """
         p = {}
         for ep in _extra_prefixes:
             p[ep] = _gather_prefix(x, ep)
 
-        def _fill(base, s):
-            prefix = base if base == "n" else f"{base}{s}"
+        def _fill(prefix):
             if prefix in _constraints:
-                arr = _constraints[prefix](p)
+                p[prefix] = _constraints[prefix](p)
             else:
-                arr = _gather_prefix(x, prefix)
-            p[prefix] = arr
+                p[prefix] = _gather_prefix(x, prefix)
 
-        _fill("n", None)
-        for s in range(Nelectrons):
-            for b in ("Te", "ue", "pe", "efract"):
-                _fill(b, s)
-        for s in range(Nions):
-            for b in ("Ti", "ui", "pi", "ifract"):
-                _fill(b, s)
+        _fill("n")
+        for base, s in _species_bases:
+            _fill(f"{base}{s}")
         if background_order is not None:
             for i in range(background_order + 1):
-                _fill("bg", i)
+                _fill(f"bg{i}")
         return p
 
-    def _forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg):
-        return _call_forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg,
-                             measurement_settings)
+    def _args_from_params_dict(p):
+        """Assemble the forward-args tuple from a {prefix: (Nt,)} dict."""
+        n = p["n"]
+        Te     = jnp.stack([p[f"Te{s}"]     for s in range(Nelectrons)])
+        ue     = jnp.stack([p[f"ue{s}"]     for s in range(Nelectrons)])
+        efract = jnp.stack([p[f"efract{s}"] for s in range(Nelectrons)])
+        Ti     = jnp.stack([p[f"Ti{s}"]     for s in range(Nions)])
+        ui     = jnp.stack([p[f"ui{s}"]     for s in range(Nions)])
+        ifract = jnp.stack([p[f"ifract{s}"] for s in range(Nions)])
+        e_shapes = tuple(
+            tuple(p[shape_param_prefix(q, "e", s)] for q in m.shape_param_names)
+            for s, m in enumerate(e_models)
+        )
+        i_shapes = tuple(
+            tuple(p[shape_param_prefix(q, "i", s)] for q in m.shape_param_names)
+            for s, m in enumerate(i_models)
+        )
+        bg = (jnp.stack([p[f"bg{i}"] for i in range(background_order + 1)])
+              if background_order is not None else None)
+        return n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg
+
+    def _unpack_full(x):
+        p = _build_params_dict(x)
+        return _args_from_params_dict(p), p
+
+    def _unpack(x):
+        return _unpack_full(x)[0]
+
+    fwd = _make_forward_fn(measurement_settings, e_models, i_models)
+    _default_irf = measurement_settings.get("instr_func_arr", None)
+
+    def _forward(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg):
+        return fwd(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+                   _default_irf)
 
     # Intra-fit parallelism: when the host is exposed as multiple XLA devices
     # (THOMSON_CPU_DEVICES / --n-devices), shard the data-fidelity forward+grad
@@ -649,28 +717,22 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
     use_time_shard = want_shard and n_devices > 1 and int(Nt) >= n_devices
     sharded_nll = (
         _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, int(Nt),
-                          n_devices, has_bg=(background_order is not None))
+                          n_devices, has_bg=(background_order is not None),
+                          e_models=e_models, i_models=i_models)
         if use_time_shard else None
     )
 
     # objective_flat must NOT be jit-decorated: jit(value_and_grad(f)) works,
     # but value_and_grad(jit(f)) cannot differentiate through the jit boundary.
     def objective_flat(x):
-        n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg = _unpack(x)
+        args, p = _unpack_full(x)
         if use_time_shard:
-            loss = sharded_nll(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg)
+            loss = sharded_nll(*args)
         else:
-            fit = _forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg)
+            fit = _forward(*args)
             loss = _log_likelihood(fit, Pkl_data, Pkl_var)
-        arr_map = {
-            "n": n, "Te": Te, "ue": ue, "pe": pe, "efract": efract,
-            "Ti": Ti, "ui": ui, "pi": pi_arr, "ifract": ifract,
-        }
-        if bg is not None:
-            arr_map["bg"] = bg
-        for base, species, pset in penalty_list:
-            arr = arr_map[base] if species is None else arr_map[base][species]
-            loss = loss + _tikhonov_penalty(arr, **pset)
+        for prefix, pset in penalty_list:
+            loss = loss + _tikhonov_penalty(p[prefix], **pset)
         return loss
 
     def objective_u(u):
@@ -687,6 +749,7 @@ def _build_grad_problem(Pkl_data, Pkl_var, measurement_settings,
         build_params_dict=_build_params_dict,
         forward=_forward,
         unpack=_unpack,
+        e_models=e_models, i_models=i_models,
         varying_keys=varying_keys,
         x0_np=x0_np, u0=u0,
         lower_np=lower_np, upper_np=upper_np,
@@ -803,8 +866,8 @@ def run_fit_grad(Pkl_data, Pkl_var, measurement_settings,
     optax optimizer. Defaults to ``optax.lbfgs`` (with built-in Zoom line
     search) — the right choice for Thomson fits where the loss is mostly
     quadratic near the minimum. Adam / AdamW are available for cases where
-    LBFGS gets stuck (typically when ``pe`` / ``pi`` are free and
-    ``gammaincc`` produces near-flat regions).
+    LBFGS gets stuck (typically when shape exponents are free and the loss
+    has near-flat regions).
 
     Bounds are enforced by the unconstrained reparameterization (arcsin /
     sqrt / identity), so no clipping is needed inside the loop.
@@ -812,7 +875,9 @@ def run_fit_grad(Pkl_data, Pkl_var, measurement_settings,
     Parameters
     ----------
     Pkl_data, Pkl_var, measurement_settings, penalty_settings, params_settings :
-        See the package's deck schema and ``build_params``.
+        See the package's deck schema and ``build_params``. Per-species
+        distribution models come from ``measurement_settings["e_models"]`` /
+        ``["i_models"]`` (default ``"super_gaussian"`` everywhere).
     constraints : dict[str, str|callable] or None
         Equality-style reparameterization. Keys are parameter prefixes (e.g.
         ``"ifract1"``); values are either string expressions (evaluated against
@@ -932,11 +997,12 @@ def compute_initial_fit(measurement_settings, params_settings, extra_params, Nt)
     parameter values as typed in the deck. Use for diagnostic plots before
     launching :func:`run_fit_grad`.
     """
-    Nelectrons = measurement_settings["Nelectrons"]
-    Nions = len(measurement_settings["ion_z"])
+    e_models, i_models = resolve_models(measurement_settings)
+    Nelectrons = len(e_models)
+    Nions = len(i_models)
     background_order = measurement_settings.get("background_order", None)
 
-    params = build_params(Nelectrons, Nions, Nt, params_settings,
+    params = build_params(e_models, i_models, Nt, params_settings,
                           background_order=background_order)
     _expand_extra_params(params, extra_params, Nt)
 
@@ -945,22 +1011,29 @@ def compute_initial_fit(measurement_settings, params_settings, extra_params, Nt)
                         for i in range(Nelectrons)])
     ue     = jnp.stack([extract_params_as_array(params, f"ue{i}", Nt)
                         for i in range(Nelectrons)])
-    pe     = jnp.stack([extract_params_as_array(params, f"pe{i}", Nt)
-                        for i in range(Nelectrons)])
     efract = jnp.stack([extract_params_as_array(params, f"efract{i}", Nt)
                         for i in range(Nelectrons)])
     Ti     = jnp.stack([extract_params_as_array(params, f"Ti{i}", Nt)
                         for i in range(Nions)])
     ui     = jnp.stack([extract_params_as_array(params, f"ui{i}", Nt)
                         for i in range(Nions)])
-    pi_arr = jnp.stack([extract_params_as_array(params, f"pi{i}", Nt)
-                        for i in range(Nions)])
     ifract = jnp.stack([extract_params_as_array(params, f"ifract{i}", Nt)
                         for i in range(Nions)])
+    e_shapes = tuple(
+        tuple(extract_params_as_array(params, shape_param_prefix(q, "e", s), Nt)
+              for q in m.shape_param_names)
+        for s, m in enumerate(e_models)
+    )
+    i_shapes = tuple(
+        tuple(extract_params_as_array(params, shape_param_prefix(q, "i", s), Nt)
+              for q in m.shape_param_names)
+        for s, m in enumerate(i_models)
+    )
     bg = None
     if background_order is not None:
         bg = jnp.stack([extract_params_as_array(params, f"bg{i}", Nt)
                         for i in range(background_order + 1)])
 
-    return _call_forward(n, Te, ue, pe, efract, Ti, ui, pi_arr, ifract, bg,
-                         measurement_settings)
+    fwd = _make_forward_fn(measurement_settings, e_models, i_models)
+    return fwd(n, Te, ue, e_shapes, efract, Ti, ui, i_shapes, ifract, bg,
+               measurement_settings.get("instr_func_arr", None))

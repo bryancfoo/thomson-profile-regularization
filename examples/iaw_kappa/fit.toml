@@ -1,0 +1,82 @@
+# examples/iaw_kappa/fit.toml — IAW fit with a kappa-distributed ion species
+#
+# Demonstrates the [species] section: the single H ion species uses the
+# built-in "kappa" model, whose shape parameter becomes the fit parameter
+# `kappai0` (configured below exactly like any moment parameter).
+#
+#     python examples/data/make_data_kappa.py   # one-time
+#     thomson-fit examples/iaw_kappa/fit.toml
+
+[data]
+path        = "../data/data_kappa.h5"
+pkl_dataset = "Pkl_data"
+var_dataset = "Pkl_var"
+time_axis   = "../data/data_kappa.h5:time"
+
+[species]
+electron = ["maxwellian"]                      # no shape params
+ion      = [{ model = "kappa", x_max = 25.0, n_points = 2001 }]
+
+[measurement]
+Nelectrons       = 1
+ion_z            = [1]
+ion_a            = [1]
+probe_wavelength = 2.6325e-7
+probe_vec        = [0.0,       0.0, 1.0]
+scatter_vec      = [0.8660254, 0.0, 0.5]
+ue_dir           = [1.0, 0.0, 0.0]
+ui_dir           = [1.0, 0.0, 0.0]
+wavelengths      = "../data/data_kappa.h5:wavelengths"
+normalization_type = "max"
+
+[params.n]
+value = 6.0e19
+vary  = false                                  # density pinned (IAW shape is
+                                               # weakly sensitive over this range)
+
+# Drifts and fractions pinned: single-species data with no flow. (Leaving
+# these free with unbounded defaults gives NaN gradients — same behavior as
+# the original package — so pin or bound them.)
+[params.ue0]
+value = 0.0
+vary  = false
+[params.ui0]
+value = 0.0
+vary  = false
+[params.efract0]
+value = 1.0
+vary  = false
+[params.ifract0]
+value = 1.0
+vary  = false
+[params.Te0]
+value = 450.0
+min   = 100.0
+max   = 1500.0
+vary  = true
+
+[params.Ti0]
+value = 250.0
+min   = 50.0
+max   = 1000.0
+vary  = true
+
+[params.kappai0]                               # kappa model shape parameter
+value = 5.0
+min   = 1.7
+max   = 30.0
+vary  = true
+
+[fit]
+optimizer = "lbfgs"
+max_iter  = 600
+tol       = 1e-10
+
+[output]
+path = "fit_result.h5"
+
+[plotting]
+shot_num    = "kappa-demo"
+streak_png  = "streak.png"
+profiles_png = "profiles.png"
+profile_vars = ["Te0", "Ti0", "kappai0"]

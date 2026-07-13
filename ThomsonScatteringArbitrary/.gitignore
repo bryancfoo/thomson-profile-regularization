@@ -1,5 +1,0 @@
-# Generated artifacts under this package's examples/
-examples/data/data_kappa.h5
-examples/data/data_epw_2temp.h5
-examples/*/fit_result.h5
-examples/*/*.png

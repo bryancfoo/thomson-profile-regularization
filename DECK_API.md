@@ -147,6 +147,114 @@ normalization_type = "max"                      # "max" | "sum" | "integral"
 normalization_scale = 1                         # multiplier on the norm
 ```
 
+### `[species]` — per-species velocity-distribution models (optional)
+
+Selects a distribution model per species. Lists must match `Nelectrons` and
+`len(ion_z)`. A deck with no `[species]` section behaves exactly like the
+original package: every species defaults to `super_gaussian` with its
+`pe`/`pi` exponent parameters.
+
+```toml
+[species]
+electron = ["maxwellian"]
+ion      = ["super_gaussian", { model = "kappa", x_max = 25.0, n_points = 2001 }]
+# or a custom callable (path relative to the deck file):
+# electron = ["my_dists.py:two_temp"]
+```
+
+Each entry is one of:
+
+| form | meaning |
+|---|---|
+| `"maxwellian"` | Maxwellian, no shape params (analytic fast path) |
+| `"super_gaussian"` | super-Gaussian of order `p` ∈ [2, 5] (analytic fast path — tabulated Z′; shape param `p`) |
+| `"kappa"` | kappa / Lorentzian-tailed distribution (general path; shape param `kappa`, κ > 3/2) |
+| `"super_gaussian_numeric"` | the super-Gaussian routed through the general quadrature — for validation only |
+| `"file.py:function"` | custom callable (general path; see contract below) |
+| inline table `{ model = "...", x_max = ..., n_points = ... }` | any of the above plus quadrature options |
+
+**Quadrature options** (general-path models only): `x_max` (half-width of the
+normalized-velocity grid; default 10, kappa default 20 — raise it for
+fat-tailed distributions) and `n_points` (Simpson points; default 2001, forced
+odd). Accuracy of the dispersion integral scales as `(2·x_max/n_points)²`;
+runtime and memory scale linearly in `n_points`. `time_batch` controls how
+many time rows the quadrature vectorizes together: the default `"auto"`
+vectorizes the whole time axis when the `Nt·Nk·n_points` slab fits a 4 GiB
+budget and falls back to a sequential row map otherwise; an explicit int
+chunks that many rows at a time (intermediate chunk sizes measured *slower*
+than either extreme on a memory-bandwidth-bound CPU — see SPEED_NOTES.md).
+
+**Shape parameters become fit parameters** under the prefix
+`<name><e|i><species_idx>`:
+
+- super-Gaussian `p` on electron species 0 → `pe0` (unchanged naming)
+- `kappa` on ion species 1 → `kappai1`
+- custom `two_temp(x, fhot, rhot)` on electron species 0 → `fhote0`, `rhote0`
+
+They are configured through `[params.*]`, `[penalty.*]`, `[constraints]`, and
+appear in the output HDF5 `/params/<prefix>` exactly like the moment
+parameters. The three-level specificity (`fhote0_3` > `fhote0` > `fhote`)
+applies as usual. Defaults come from the model (registry defaults, or the
+callable's Python default arguments); parameters without a model default must
+be given a `value` in the deck. The check that super-Gaussian exponents
+satisfy `min >= 2` is enforced only for species actually using the analytic
+`super_gaussian` model.
+
+**Custom-callable contract:**
+
+```python
+# my_dists.py
+import jax.numpy as jnp
+
+def two_temp(x, fhot=0.1, rhot=3.0):
+    """g(x): normalized 1D reduced distribution, ∫ g dx = 1."""
+    cold = (1.0 - fhot) * jnp.exp(-x**2) / jnp.sqrt(jnp.pi)
+    hot  = fhot * jnp.exp(-x**2 / rhot) / jnp.sqrt(jnp.pi * rhot)
+    return cold + hot
+```
+
+- **First argument**: the normalized parallel velocity `x = (v − u)/vth`,
+  `vth = sqrt(2·T/m)`, where `T` and `u` are the species' temperature and
+  drift fit parameters. The function receives scalars (the package `vmap`s
+  it), so no broadcasting logic is needed.
+- **Remaining arguments**: shape parameters. Names must not contain
+  underscores; defaults become fit-parameter defaults.
+- **Return**: the 1D distribution *reduced along the scattering wavevector k*
+  (already projected — the most general convention: anisotropic/beam
+  distributions are expressible). Normalize so `∫ g dx = 1`; a Maxwellian is
+  `exp(−x²)/√π` (variance ½). If your family's `T` convention differs (e.g.
+  kappa), document it — `vth` is whatever `sqrt(2·T/m)` gives for the fitted
+  `T`. For isotropic 3D distributions f(|v|), supply the 1D reduction
+  `g(x) = 2π ∫_|x| f(s) s ds` yourself.
+- Must be **JAX-differentiable** in `x` (always; the dispersion integral uses
+  `jax.grad` for g′ and g″) and in any shape parameter left free in the fit.
+  Avoid non-smooth constructs (`jnp.where` branches that produce `0·inf` in
+  gradients, `abs` powers below 2 at the origin, …).
+
+**How it enters the physics** — for each species, with
+ζ = (ω − k·u)/(k·vth):
+
+```
+chi_s   = wp_s²/(vth_s·k)² · [ P∫ g′(x)/(ζ − x) dx + iπ·g′(ζ) ]
+S(k,ω) ∝ Σ_s  2π/(k·vth_s) · |screening_s|² · g_s(ζ_s)
+```
+
+Analytic models use the tabulated Z′(ζ,p) (bit-identical to the original
+package); general models evaluate the principal-value integral by
+singularity-subtracted Simpson quadrature on the fixed grid, with an exact
+log tail term (validated to ~1e-5 relative —
+`ThomsonScattering/benchmarks/parity_dispersion.py`).
+
+**General-path notes**: when any species uses the general (quadrature) path,
+the sampling preconditioners skip `jax.hessian` (compile through the
+quadrature is prohibitive) and use the batched finite-difference fallback
+automatically. Cost is roughly `Nt·Nk·n_points` array work per objective
+evaluation (~30–130 ms per value-and-gradient at `Nt=8, Nk=200,
+n_points=1001–4001` on CPU) — use the smallest `n_points` your accuracy
+needs. Model specs are stored as plain strings/dicts and resolved inside
+each worker process, so `[l_curve]` with `n_workers > 1` works with registry
+models and custom callables alike.
+
 ### `[probe_beam]` (optional, disables when absent)
 
 Probe-beam SRS/SBS amplification correction
@@ -384,6 +492,17 @@ printed with their physical-parameter loadings (also exported under
 `/laplace/nonidentified_*`). `full_hessian` is the better mass matrix when
 such correlated directions dominate the posterior.
 
+**Slack dummies and HMC mixing.** An `[[extra_params]]` dummy whose
+constraint switches between active and inactive *within the posterior*
+(e.g. `ifract1_floor` when `1 - ifract0` straddles the floor) creates two
+curvature regimes along one direction — flat where inactive,
+data-stiff where active. No fixed mass matrix serves both, so the HMC step
+size adapts small and mixing on such decks is slow (high R-hat on the
+coupled parameters; the σ estimates still agree with Laplace to ~20% in
+practice). If you see this: pin the dummy (`vary = false`), bound it away
+from the switching region, or use `method = "laplace"` — the MAP fit and
+Laplace bars are unaffected by this geometry.
+
 **Temperature semantics.** `"auto"` resolves to `2 / N_pixels_valid`, which
 rescales the user's per-pixel-mean `V_fit = mean(r²/σ²) + Σ λ_o·mean(d_o²)`
 into the proper Gaussian negative log-likelihood `0.5·sum(r²/σ²)` plus an
@@ -552,6 +671,17 @@ figsize = [12, 6]
 dpi     = 150
 cmap    = "viridis"
 ```
+
+A `[species]` section selects distribution models exactly as in fit decks.
+Shape-parameter profiles are looked up in `[profiles]` as `<name><e|i><idx>`
+first, then `<name><e|i>` (scalar, `(Nt,)`, or `(Nspecies, Nt)`) — so the
+`pe` / `pi` keys above keep working.
+
+**Unit note:** the pre-rewrite `thomson_forward.py` passed `ne` (cm⁻³) and
+temperatures (eV) to the forward model without converting to SI — a latent
+unit bug. The current CLI converts (`×1e6`, `×e/kB`), matching `thomson-fit`
+and this document. Forward decks tuned against the old CLI's raw
+pass-through will produce different (now-correct) output.
 
 ---
 
@@ -750,3 +880,21 @@ The six example subdirectories, each with its own `fit.toml`/`forward.toml`,
   `notch`, `background_order = 1`, `[probe_beam]` (with `gain_mode = "off"`
   so the section is parsed but the correction is disabled), and
   `[penalty.*]` Tikhonov terms. Optimizer: Adam.
+- [`examples/iaw_kappa/`](examples/iaw_kappa/) — `[species]` with the
+  built-in `kappa` ion model (general quadrature path); fits `Te0`, `Ti0`,
+  and the per-time `kappai0` profile against
+  [`make_data_kappa.py`](examples/data/make_data_kappa.py) synthetic truth
+  (recovers the κ ramp).
+- [`examples/epw_custom_dist/`](examples/epw_custom_dist/) — a
+  user-supplied callable ([`my_dists.py:two_temp`](examples/epw_custom_dist/my_dists.py),
+  bi-Maxwellian electrons); fits the hot-electron fraction `fhote0` against
+  [`make_data_epw_2temp.py`](examples/data/make_data_epw_2temp.py) truth.
+
+[`examples/forward_model_examples.ipynb`](examples/forward_model_examples.ipynb)
+walks the forward-model Python API (spectral density, species models,
+custom distributions) interactively.
+
+Benchmarks live in [`ThomsonScattering/benchmarks/`](ThomsonScattering/benchmarks/):
+`parity_dispersion.py` (general quadrature vs tabulated-Z′ analytic path),
+`bench_maxwellian.py` (fit-level regression + timing on the example decks),
+`smoke_sampling_lcurve.py` (sampler + L-curve smoke on the general path).

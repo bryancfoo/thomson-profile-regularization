@@ -3,13 +3,23 @@
 Usage
 -----
     thomson-forward path/to/deck.toml        # after `pip install -e .`
-    python thomson-forward.py path/to/deck.toml
-    python thomson-forward.py                # falls back to interactive prompt
+    python thomson_forward.py path/to/deck.toml
+    python thomson_forward.py                # falls back to interactive prompt
 
 Takes an input deck (TOML) specifying plasma parameter profiles, computes the
 forward-model Thomson scattering spectrum, and plots the time-resolved streak.
-The deck schema includes sections: [profiles], [measurement], [plotting], and
-[output].
+The deck schema includes sections: [profiles], [measurement], [species],
+[plotting], and [output].
+
+Distribution shape parameters live in [profiles] under their parameter-prefix
+names: ``pe`` / ``pi`` for the default super-Gaussian models (scalar, (Nt,),
+or (Nspecies, Nt) — backward compatible), or per-species keys like
+``kappai0`` for other models.
+
+Units follow the package convention (and the fit decks): ne in cm^-3,
+temperatures in eV. NOTE: the original package's forward CLI passed deck
+values to the forward model without converting these to SI — that was a
+latent unit bug, fixed here; this CLI now matches thomson-fit's conversions.
 
 See ``DECK_API.md`` at the repo root for the full deck schema.
 """
@@ -21,8 +31,47 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.constants import k as kB, e
 
-from ThomsonScattering.deck import load_deck, _load_array, _require
+from ThomsonScattering.deck import (
+    load_deck, _load_array, _require, parse_species_section,
+)
+from ThomsonScattering.distributions import (
+    resolve_models, shape_param_prefix,
+)
 from ThomsonScattering.forward import scattered_power_wavelength
+
+
+def _load_shape_profiles(profiles_sec, models, kind, Nt):
+    """Per-species shape-param profiles from [profiles].
+
+    For shape param ``q`` of species ``s`` the lookup is ``f"{q}{kind}{s}"``
+    first, then ``f"{q}{kind}"`` (scalar → broadcast, (Nt,) → shared across
+    species, (Nspecies, Nt) → indexed) — so old decks' ``pe`` / ``pi`` keys
+    keep working.
+    """
+    shapes = []
+    for s, model in enumerate(models):
+        entries = []
+        for q in model.shape_param_names:
+            key_specific = shape_param_prefix(q, kind, s)
+            key_global = f"{q}{kind}"
+            if key_specific in profiles_sec:
+                arr = np.asarray(profiles_sec[key_specific], dtype=float)
+            elif key_global in profiles_sec:
+                arr = np.asarray(profiles_sec[key_global], dtype=float)
+                if arr.ndim == 2:
+                    arr = arr[s]
+            else:
+                default = model.shape_param_defaults.get(q, {})
+                if "value" not in default:
+                    raise KeyError(
+                        f"[profiles] missing shape parameter {key_specific!r} "
+                        f"(or {key_global!r}) for model {model.name!r}, which "
+                        "has no default value."
+                    )
+                arr = np.asarray(default["value"], dtype=float)
+            entries.append(np.broadcast_to(arr, (Nt,)))
+        shapes.append(tuple(entries))
+    return tuple(shapes)
 
 
 def build_settings_from_forward_deck(deck):
@@ -47,7 +96,7 @@ def build_settings_from_forward_deck(deck):
     profiles_sec = deck.get("profiles", {})
     _require(
         profiles_sec,
-        ["time", "ne", "Te", "Ti", "ue", "ui", "pe", "pi", "efract", "ifract"],
+        ["time", "ne", "Te", "Ti", "ue", "ui", "efract", "ifract"],
         section="[profiles]",
     )
 
@@ -63,10 +112,6 @@ def build_settings_from_forward_deck(deck):
     # Load velocities
     ue = np.asarray(profiles_sec["ue"])
     ui = np.asarray(profiles_sec["ui"])  # shape (Nions, Nt)
-
-    # Load distribution exponents
-    pe = np.asarray(profiles_sec["pe"])
-    pi = np.asarray(profiles_sec["pi"])  # shape (Nions, Nt)
 
     # Load species fractions
     efract = np.asarray(profiles_sec["efract"])
@@ -117,6 +162,12 @@ def build_settings_from_forward_deck(deck):
 
     wavelengths = measurement_settings["wavelengths"]
 
+    # Per-species distribution models ([species] section; default super_gaussian)
+    parse_species_section(deck, measurement_settings)
+    e_models, i_models = resolve_models(measurement_settings)
+    e_shapes = _load_shape_profiles(profiles_sec, e_models, "e", Nt)
+    i_shapes = _load_shape_profiles(profiles_sec, i_models, "i", Nt)
+
     # Optional probe-beam parameters for SRS/SBS gain correction
     pb = deck.get("probe_beam")
     if pb is not None:
@@ -135,15 +186,17 @@ def build_settings_from_forward_deck(deck):
         measurement_settings["pol_p_fraction"] = fp
         measurement_settings["gain_mode"] = mode
 
-    # ── 3. Call forward model ────────────────────────────────────────────────
+    # ── 3. Call forward model (deck units: cm^-3 / eV → SI) ──────────────────
     Pklam = scattered_power_wavelength(
-        n=n,
+        n=n * 1e6,
         ue=ue,
         ui=ui,
-        Te=Te,
-        Ti=Ti,
-        pe=pe,
-        pi=pi,
+        Te=Te * e / kB,
+        Ti=Ti * e / kB,
+        e_models=e_models,
+        i_models=i_models,
+        e_shapes=e_shapes,
+        i_shapes=i_shapes,
         efract=efract,
         ifract=ifract,
         ion_z=np.asarray(measurement_settings["ion_z"]),

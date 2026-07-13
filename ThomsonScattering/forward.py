@@ -1,19 +1,38 @@
+"""Thomson-scattering forward model with per-species arbitrary distributions.
+
+Same physics pipeline as the original ThomsonScattering package (geometry,
+Doppler shifts, susceptibilities, dielectric screening, wavelength-space
+conversion, IRF/throughput/notch/background/normalization, SRS/SBS gain), but
+each electron/ion species carries a :class:`~.distributions.Distribution`
+model instead of being hard-wired to a super-Gaussian:
+
+    chi_s     = wp_s^2 / (vth_s * k)^2 * model_s.disp(zeta_s, shape_s)
+    feature_s ∝ 2*pi / (k * vth_s) * |screening|^2 * model_s.reduced(zeta_s, shape_s)
+
+For the analytic ``maxwellian`` / ``super_gaussian`` models this reproduces
+the original code's tabulated-Z' + incomplete-gamma formulas exactly
+(``disp = 2*_Zprime`` cancels the original's leading 2; ``reduced`` is the
+identical bracket). General models route through the quadrature in
+:mod:`.dispersion`.
+
+Shape parameters are passed as ``e_shapes`` / ``i_shapes``: a tuple over
+species of tuples of (Nt,) arrays, ordered as each model's
+``shape_param_names``. The models themselves are static Python objects
+(close over them or mark them static under jit).
+"""
 from typing import NamedTuple
 
 import jax.numpy as jnp
-from jax import vmap, jit
+from jax import vmap
 from scipy.constants import c, m_e, m_p
 from . import plasma
 from . import gain as _gain
-from .dispersion import _Zprime
-from jax.scipy.special import gamma, gammaincc
-from jax.scipy.signal import convolve
 from .arrays import reshape_moments
 
 
 # Bundle of intermediates returned by `_spectral_density`. The susceptibilities
 # and dielectric are kept on the same (Nk, Nt) grid as Skw so the gain
-# correction can reuse them without recomputing _Zprime.
+# correction can reuse them without recomputing the dispersion functions.
 class SpectralDensityOut(NamedTuple):
     Skw: jnp.ndarray       # (Nk, Nt) real
     sum_chiE: jnp.ndarray  # (Nk, Nt) complex
@@ -32,18 +51,17 @@ class SpectralDensityOut(NamedTuple):
 
 
 #Computes spectral density S(k, w)
-#Note: this takes lambda as input but is technically a function of omega (convention, I guess)
-#backend function (for now)
-#No input sanitization
-#Everything should be in the shape [Nions, Nt, Nk]
+#Backend function; no input sanitization.
+#Moment arrays come in as (Nspecies, Nt, 1); wavelengths as (1, 1, Nk).
+#e_shapes / i_shapes are tuples (per species) of tuples of (Nt,) arrays.
 def _spectral_density(
         n,
         ue,
         ui,
         Te,
         Ti,
-        pe,
-        pi,
+        e_shapes,
+        i_shapes,
         efract,
         ifract,
         ion_z,
@@ -54,7 +72,12 @@ def _spectral_density(
         scatter_vec,
         ue_dir,
         ui_dir,
+        e_models,
+        i_models,
 ):
+    Nelectrons = len(e_models)
+    Nions = len(i_models)
+
     #Compute the Thomson geometry
     scattering_angle = jnp.arccos(jnp.dot(probe_vec, scatter_vec))
     k_vec = scatter_vec - probe_vec
@@ -66,7 +89,6 @@ def _spectral_density(
 
     #Compute electron and ion densities of each population
     ne = n * efract
-    #zbar = jnp.sum(ifract * ion_z, axis = 0)
     ni = n * ifract / ion_z # Note this is charge fraction not ion number fraction...
 
     #Compute total plasma frequency
@@ -88,76 +110,62 @@ def _spectral_density(
     we = w - ue * k * jnp.dot(ue_dir, k_vec)
     wi = w - ui * k * jnp.dot(ui_dir, k_vec)
 
-
-    #Scattering parameter alpha
-    #alpha = jnp.sqrt(2) * wpe / np.outer(k, vT_e)
-
     #Normalize the phase velocities to the thermal velocity
-    zetae = we / (k * vTe)
-    zetai = wi / (k * vTi)
+    zetae = we / (k * vTe)   # (Nelectrons, Nt, Nk)
+    zetai = wi / (k * vTi)   # (Nions, Nt, Nk)
 
-    # Cache gamma evaluations on p — these were each computed at multiple call
-    # sites, and now also avoid the Nk-fold redundancy that the dropped
-    # jnp.repeat used to introduce inside _Zprime.
-    g3_pe = gamma(3 / pe)
-    g5_pe = gamma(5 / pe)
-    g2_pe = gamma(2 / pe)
-    ratio_pe = jnp.sqrt(2 / 3 * g5_pe / g3_pe)
-
-    g3_pi = gamma(3 / pi)
-    g5_pi = gamma(5 / pi)
-    g2_pi = gamma(2 / pi)
-    ratio_pi = jnp.sqrt(2 / 3 * g5_pi / g3_pi)
-
-    #Also normalize to the characteristic velocity vp
-    xe = zetae * ratio_pe
-    xi = zetai * ratio_pi
-
-    # Calculate the susceptibilities. _Zprime now broadcasts p against zeta
-    # internally, so we pass pe / pi at their natural shape.
+    # Susceptibilities, species by species: each model supplies the full
+    # generalized dispersion derivative Zgen = PV-Hilbert(g') + i*pi*g', so
+    # chi = wp^2/(vth*k)^2 * Zgen (no leading 2 — for the analytic
+    # super-Gaussian models, disp = 2*_Zprime absorbs the original factor).
     # Use plasma_frequency_sq (no sqrt) so the gradient is finite when n=0.
-    # sqrt(0) has an infinite gradient; squaring it back gives 0*inf = NaN in VJP.
     wpe_sq = plasma.plasma_frequency_sq(ne, 1, m_e / m_p)
-    chiE = 2 * wpe_sq / (vTe * k)**2 * _Zprime(zetae, pe)
-
     wpi_sq = plasma.plasma_frequency_sq(ni, ion_z, ion_a)
-    chiI = 2 * wpi_sq / (vTi * k) ** 2 * _Zprime(zetai, pi)
+
+    k2d = k[0]  # (Nt, Nk)
+
+    # Fused disp+reduced per species: the general (quadrature) models
+    # evaluate both in a single traversal of the time axis instead of two.
+    e_dr = [e_models[s].disp_and_reduced(zetae[s], e_shapes[s])
+            for s in range(Nelectrons)]
+    i_dr = [i_models[s].disp_and_reduced(zetai[s], i_shapes[s])
+            for s in range(Nions)]
+
+    chiE = [
+        wpe_sq[s] / (vTe[s] * k2d) ** 2 * e_dr[s][0]
+        for s in range(Nelectrons)
+    ]
+    chiI = [
+        wpi_sq[s] / (vTi[s] * k2d) ** 2 * i_dr[s][0]
+        for s in range(Nions)
+    ]
 
     #longitudinal dielectric function
-    sum_chiE = jnp.sum(chiE, axis = 0)
-    sum_chiI = jnp.sum(chiI, axis = 0)
+    sum_chiE = sum(chiE)
+    sum_chiI = sum(chiI)
     epsilon = 1 + sum_chiE + sum_chiI
 
-    #electron and ion contributions to Skw
-    econtr = efract * (
-            2
-            * jnp.pi
-            / k
-            / vTe
-            / (2 * g3_pe)
-            * ratio_pe
-            * jnp.power(jnp.abs(1 - sum_chiE / epsilon), 2)
-            * gammaincc(2 / pe, jnp.abs(xe) ** pe)
-            * g2_pe
-    )
+    #electron and ion contributions to Skw: the reduced 1D distribution
+    #evaluated at the phase velocity, weighted by the dielectric screening
+    e_screen = jnp.power(jnp.abs(1 - sum_chiE / epsilon), 2)
+    i_screen = jnp.power(jnp.abs(sum_chiE / epsilon), 2)
 
-    icontr = ifract * (
-        2
-        * jnp.pi
-        * ion_z
-        / k
-        / vTi
-        / (2 * g3_pi)
-        * ratio_pi
-        * jnp.power(jnp.abs(sum_chiE / epsilon), 2)
-        * gammaincc(2 / pi, jnp.abs(xi) ** pi)
-        * g2_pi
-    )
+    econtr = [
+        efract[s] * 2 * jnp.pi / (k2d * vTe[s])
+        * e_screen
+        * e_dr[s][1]
+        for s in range(Nelectrons)
+    ]
+    icontr = [
+        ifract[s] * 2 * jnp.pi * ion_z[s] / (k2d * vTi[s])
+        * i_screen
+        * i_dr[s][1]
+        for s in range(Nions)
+    ]
 
-    Skw = jnp.real(jnp.sum(econtr, axis = 0)+jnp.sum(icontr, axis = 0))
+    Skw = jnp.real(sum(econtr) + sum(icontr))
 
-    # k, ks come in with a leading singleton (1, Nt, Nk); strip it so all
-    # returned arrays share the (Nk, Nt) orientation of Skw.T.
+    # All returned arrays share the (Nk, Nt) orientation of Skw.T.
     return SpectralDensityOut(
         Skw=Skw.T,
         sum_chiE=sum_chiE.T,
@@ -167,17 +175,37 @@ def _spectral_density(
         ks=ks[0].T,
     )
 
-# This is the user-facing function. It takes regular sized inputs and reshapes them as needed
-# to be used in _spectral_density
-# UNFINISHED
+
+def _normalize_shapes(shapes, models, Nt, kind):
+    """Coerce per-species shape params into tuples of (Nt,) float arrays."""
+    if shapes is None:
+        shapes = tuple(() for _ in models)
+    if len(shapes) != len(models):
+        raise ValueError(
+            f"{kind}_shapes has {len(shapes)} species entries; expected "
+            f"{len(models)} (one per model)."
+        )
+    out = []
+    for s, (model, sh) in enumerate(zip(models, shapes)):
+        sh = tuple(jnp.broadcast_to(jnp.asarray(v, dtype=jnp.float64), (Nt,))
+                   for v in sh)
+        if len(sh) != len(model.shape_param_names):
+            raise ValueError(
+                f"{kind}_shapes[{s}] has {len(sh)} entries; model "
+                f"{model.name!r} expects {model.shape_param_names}."
+            )
+        out.append(sh)
+    return tuple(out)
+
+
+# This is the user-facing spectral density. It takes regular sized inputs and
+# reshapes them as needed for _spectral_density.
 def spectral_density(
         n,
         ue,
         ui,
         Te,
         Ti,
-        pe,
-        pi,
         efract,
         ifract,
         ion_z,
@@ -188,43 +216,35 @@ def spectral_density(
         scatter_vec,
         ue_dir,
         ui_dir,
+        e_models,
+        i_models,
+        e_shapes=None,
+        i_shapes=None,
         notch=None,
 ):
-    Nelectrons = jnp.shape(efract)[0]
-    Nions = jnp.shape(ifract)[0]
+    Nelectrons = len(e_models)
+    Nions = len(i_models)
     Nt = jnp.shape(n)[0]
 
-    #reshape everything to be (Nions, Nt, Nk)
+    #reshape everything to be (Nspecies, Nt, 1)
     n = reshape_moments(n, Nions, Nt)
     ue = reshape_moments(ue, Nelectrons, Nt)
     ui = reshape_moments(ui, Nions, Nt)
     Te = reshape_moments(Te, Nelectrons, Nt)
     Ti = reshape_moments(Ti, Nions, Nt)
-    pe = reshape_moments(pe, Nelectrons, Nt)
-    pi = reshape_moments(pi, Nions, Nt)
     efract = reshape_moments(efract, Nelectrons, Nt)
     ifract = reshape_moments(ifract, Nions, Nt)
-    ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
-    ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
-    wavelengths_3d = wavelengths[jnp.newaxis, jnp.newaxis, :]
+    ion_z = jnp.asarray(ion_z)[:, jnp.newaxis, jnp.newaxis]
+    ion_a = jnp.asarray(ion_a)[:, jnp.newaxis, jnp.newaxis]
+    e_shapes = _normalize_shapes(e_shapes, e_models, Nt, "e")
+    i_shapes = _normalize_shapes(i_shapes, i_models, Nt, "i")
+
     out = _spectral_density(
-        n,
-        ue,
-        ui,
-        Te,
-        Ti,
-        pe,
-        pi,
-        efract,
-        ifract,
-        ion_z,
-        ion_a,
-        wavelengths_3d,
-        probe_wavelength,
-        probe_vec,
-        scatter_vec,
-        ue_dir,
-        ui_dir
+        n, ue, ui, Te, Ti, e_shapes, i_shapes, efract, ifract,
+        ion_z, ion_a,
+        wavelengths[jnp.newaxis, jnp.newaxis, :],
+        probe_wavelength, probe_vec, scatter_vec, ue_dir, ui_dir,
+        e_models, i_models,
     )
     Skw = out.Skw
 
@@ -236,8 +256,6 @@ def spectral_density(
     return Skw
 
 
-
-
 #Computes the wavelength spectrum (NOT the frequency spectrum!) of the scattered power
 #This is what you download off omegaops
 #Normalization options might be helpful for data analysis
@@ -247,8 +265,6 @@ def scattered_power_wavelength(
         ui,
         Te,
         Ti,
-        pe,
-        pi,
         efract,
         ifract,
         ion_z,
@@ -259,6 +275,10 @@ def scattered_power_wavelength(
         scatter_vec,
         ue_dir,
         ui_dir,
+        e_models,
+        i_models,
+        e_shapes = None,
+        i_shapes = None,
         instr_func_arr = None,
         irf_normalization = "area",
         throughput = None,
@@ -272,22 +292,22 @@ def scattered_power_wavelength(
         pol_p_fraction = 1.0,
         gain_mode = "off",
 ):
-    Nelectrons = jnp.shape(efract)[0]
-    Nions = jnp.shape(ifract)[0]
+    Nelectrons = len(e_models)
+    Nions = len(i_models)
     Nt = jnp.shape(n)[0]
 
-    #reshape everything to be (Nions, Nt, Nk)
+    #reshape everything to be (Nspecies, Nt, 1)
     n = reshape_moments(n, Nions, Nt)
     ue = reshape_moments(ue, Nelectrons, Nt)
     ui = reshape_moments(ui, Nions, Nt)
     Te = reshape_moments(Te, Nelectrons, Nt)
     Ti = reshape_moments(Ti, Nions, Nt)
-    pe = reshape_moments(pe, Nelectrons, Nt)
-    pi = reshape_moments(pi, Nions, Nt)
     efract = reshape_moments(efract, Nelectrons, Nt)
     ifract = reshape_moments(ifract, Nions, Nt)
-    ion_z = ion_z[:, jnp.newaxis, jnp.newaxis]
-    ion_a = ion_a[:, jnp.newaxis, jnp.newaxis]
+    ion_z = jnp.asarray(ion_z)[:, jnp.newaxis, jnp.newaxis]
+    ion_a = jnp.asarray(ion_a)[:, jnp.newaxis, jnp.newaxis]
+    e_shapes = _normalize_shapes(e_shapes, e_models, Nt, "e")
+    i_shapes = _normalize_shapes(i_shapes, i_models, Nt, "i")
 
     # Promote scatter_vec to (Nangles, 3); a single (3,) becomes (1, 3).
     # Aperture-averaged spectrum: vmap _spectral_density over the angle axis,
@@ -300,23 +320,11 @@ def scattered_power_wavelength(
 
     def _skw_one(svec):
         out = _spectral_density(
-            n,
-            ue,
-            ui,
-            Te,
-            Ti,
-            pe,
-            pi,
-            efract,
-            ifract,
-            ion_z,
-            ion_a,
+            n, ue, ui, Te, Ti, e_shapes, i_shapes, efract, ifract,
+            ion_z, ion_a,
             wavelengths[jnp.newaxis, jnp.newaxis, :],
-            probe_wavelength,
-            probe_vec,
-            svec,
-            ue_dir,
-            ui_dir,
+            probe_wavelength, probe_vec, svec, ue_dir, ui_dir,
+            e_models, i_models,
         )
         # Apply Turnbull et al. (PRL 2026) SRS/SBS gain correction per ray.
         # Each aperture-averaged scatter angle sees its own theta_s, so L and

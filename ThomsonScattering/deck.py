@@ -1,5 +1,27 @@
 """TOML input-deck loading, expansion, and result writing.
 
+Port of the original ThomsonScattering.deck plus the ``[species]`` section
+for choosing per-species distribution models:
+
+    [species]
+    electron = ["super_gaussian"]
+    ion = ["maxwellian", { model = "kappa", x_max = 25.0 }]
+    # or a custom callable (path relative to the deck):
+    # ion = ["my_dists.py:hot_tail"]
+
+Each entry is either a registry name (``maxwellian``, ``super_gaussian``,
+``kappa``, ...), a ``"file.py:function"`` reference to a JAX callable
+``g(x, *shape_params)`` (the normalized 1D reduced distribution on
+x = (v − u)/vth, vth = sqrt(2T/m)), or an inline table with a ``model`` key
+plus quadrature options (``x_max``, ``n_points``). When the section is
+absent every species defaults to ``super_gaussian`` — identical behavior and
+parameters (``pe``/``pi``) to the original package.
+
+Shape parameters of each model become fit parameters named
+``<name><e|i><species>`` (e.g. ``pe0``, ``kappai1``) and are configured via
+``[params.*]`` / ``[penalty.*]`` / ``[constraints]`` exactly like the moment
+parameters.
+
 Two public entry points:
 - ``load_deck(path)`` reads a TOML file and tags it with ``_base_dir`` /
   ``_deck_stem`` so downstream code can resolve relative paths.
@@ -99,6 +121,73 @@ def _require(d, keys, section):
         )
 
 
+def _spec_model_name(spec):
+    """Model name from a species spec (string or inline table)."""
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, dict):
+        try:
+            return spec["model"]
+        except KeyError:
+            raise ValueError(
+                f"[species] table entry {spec!r} is missing the 'model' key."
+            ) from None
+    raise TypeError(
+        f"[species] entries must be strings or tables, got {type(spec).__name__!r}"
+    )
+
+
+def parse_species_section(deck, measurement_settings):
+    """Resolve the ``[species]`` section into measurement_settings model specs.
+
+    Stores plain (picklable) specs under ``e_models`` / ``i_models`` plus
+    ``_model_base_dir`` for resolving relative custom-callable paths; actual
+    Distribution objects are built inside each fit process by
+    :func:`~.distributions.resolve_models`.
+
+    Returns ``(e_specs, i_specs)`` (either may be None when defaulted).
+    """
+    base_dir = deck.get("_base_dir", _pathlib.Path("."))
+    species_sec = deck.get("species", {}) or {}
+    e_specs = species_sec.get("electron")
+    i_specs = species_sec.get("ion")
+
+    Nelectrons = measurement_settings.get("Nelectrons")
+    Nions = len(measurement_settings.get("ion_z", []))
+
+    if e_specs is not None:
+        for sp in e_specs:
+            _spec_model_name(sp)  # validates form
+        if Nelectrons is not None and len(e_specs) != Nelectrons:
+            raise ValueError(
+                f"[species] electron has {len(e_specs)} entries but "
+                f"[measurement] Nelectrons = {Nelectrons}."
+            )
+        measurement_settings["e_models"] = list(e_specs)
+    if i_specs is not None:
+        for sp in i_specs:
+            _spec_model_name(sp)
+        if Nions and len(i_specs) != Nions:
+            raise ValueError(
+                f"[species] ion has {len(i_specs)} entries but "
+                f"[measurement] ion_z has {Nions} entries."
+            )
+        measurement_settings["i_models"] = list(i_specs)
+    if e_specs is not None or i_specs is not None:
+        measurement_settings["_model_base_dir"] = str(base_dir)
+    return e_specs, i_specs
+
+
+def _super_gaussian_species(specs, n_species):
+    """Indices of species using the analytic super_gaussian model."""
+    if specs is None:
+        return set(range(n_species))
+    return {
+        idx for idx, sp in enumerate(specs)
+        if _spec_model_name(sp) == "super_gaussian"
+    }
+
+
 def build_settings_from_deck(deck):
     """Convert a parsed deck dict (from load_deck) into arguments for run_fit_grad.
 
@@ -107,6 +196,8 @@ def build_settings_from_deck(deck):
     Pkl_data            : np.ndarray (Nk, Nt)
     Pkl_var             : np.ndarray (Nk, Nt)
     measurement_settings : dict
+        Includes ``e_models`` / ``i_models`` specs when a ``[species]``
+        section is present (absent → all species default to super_gaussian).
     penalty_settings    : dict or None
     params_settings     : dict or None
     fit_settings        : dict
@@ -168,6 +259,9 @@ def build_settings_from_deck(deck):
             measurement_settings[key] = tuple(val)
         else:
             measurement_settings[key] = val
+
+    # Per-species distribution models from the [species] section.
+    e_specs, i_specs = parse_species_section(deck, measurement_settings)
 
     # Optional probe-beam parameters for the SRS/SBS gain correction
     # (Turnbull et al., PRL 136, 135101 (2026)). Absent section ⇒ correction
@@ -248,19 +342,31 @@ def build_settings_from_deck(deck):
         if _per_time_re.match(key):
             params_settings[key] = dict(kw)
 
-    # Super-Gaussian exponents pe / pi are sampled through _Zprime, which
-    # interpolates from a precomputed table covering p ∈ [2.0, 5.0]. Below
-    # 2.0 the forward model silently extrapolates and produces NaN. Refuse
-    # bounds that allow that, so a user typo doesn't quietly poison a long fit.
-    _p_key_re = _re.compile(r"^p[ei](\d+(?:_\d+)?)?$|^p[ei]$")
+    # Super-Gaussian exponents pe / pi are sampled through the tabulated
+    # _Zprime, which covers p ∈ [2.0, 5.0]. Below 2.0 the forward model
+    # silently extrapolates and produces NaN. Refuse bounds that allow that,
+    # so a user typo doesn't quietly poison a long fit. The check only
+    # applies to species actually using the analytic 'super_gaussian' model —
+    # a custom model whose shape param happens to be named "p" sets its own
+    # valid range.
+    Nelectrons = measurement_settings["Nelectrons"]
+    Nions = len(measurement_settings["ion_z"])
+    _sg_e = _super_gaussian_species(e_specs, Nelectrons)
+    _sg_i = _super_gaussian_species(i_specs, Nions)
+    _p_key_re = _re.compile(r"^p([ei])(\d+)?(?:_\d+)?$")
     for key, kw in params_settings.items():
-        if _p_key_re.match(key) and "min" in kw:
-            if float(kw["min"]) < 2.0:
-                raise ValueError(
-                    f"[params.{key}] min = {kw['min']!r} is below 2.0. The "
-                    f"super-Gaussian exponent table covers p ∈ [2.0, 5.0]; "
-                    f"values below 2.0 cause silent NaN in the forward model."
-                )
+        m = _p_key_re.match(key)
+        if not m or "min" not in kw:
+            continue
+        kind, sp_idx = m.group(1), m.group(2)
+        sg_set = _sg_e if kind == "e" else _sg_i
+        applies = bool(sg_set) if sp_idx is None else int(sp_idx) in sg_set
+        if applies and float(kw["min"]) < 2.0:
+            raise ValueError(
+                f"[params.{key}] min = {kw['min']!r} is below 2.0. The "
+                f"super-Gaussian exponent table covers p ∈ [2.0, 5.0]; "
+                f"values below 2.0 cause silent NaN in the forward model."
+            )
 
     params_settings = params_settings or None
 
@@ -371,8 +477,8 @@ def save_fit_results(output_path, result, best_fit, deck_text=None,
     - ``/time``             : (Nt,) time array (if provided)
 
     When ``l_curve_result`` is provided (from
-    :func:`ThomsonScattering.l_curve.compute_L_curve`), a ``/l_curve`` group
-    is added with the full sweep:
+    :func:`ThomsonScattering.l_curve.compute_L_curve`), a
+    ``/l_curve`` group is added with the full sweep:
     - ``/l_curve/lambda_scale``       — (N,)
     - ``/l_curve/residual_norm``      — (N,)
     - ``/l_curve/penalty_norm``       — (N,)
@@ -464,12 +570,16 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
     """Write posterior summary + (optionally) raw samples into ``fh``.
 
     Writes the ``/summary/...`` group, ``/varying_keys``, and (when available)
-    the MAP-Hessian ``/hessian_u`` + ``/hessian_ref`` always. When
-    ``save_samples`` is True, additionally writes the full posterior chains
+    the MAP-Hessian ``/hessian_u`` + ``/hessian_ref`` and the ``/laplace``
+    group always. When ``save_samples`` is True and the result carries chains
+    (``method == "mcmc"``), additionally writes the full posterior chains
     under ``/samples/<prefix>`` plus ``/u_samples``, ``/log_probs``,
-    ``/step_size_history``, and ``/u_chain_init``.
+    ``/step_size_history``, and ``/u_chain_init``. Laplace-only results
+    (``method == "laplace"``) have no chains; their summary std/percentiles
+    come from the delta-method covariance.
     """
     import h5py
+    has_samples = getattr(samp, "samples_phys", None) is not None
     summary = fh.create_group("summary")
     for stat in ("mean", "std", "p16", "p50", "p84"):
         g = summary.create_group(stat)
@@ -478,46 +588,68 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
     corr_g = summary.create_group("correlations")
     for prefix, s in samp.summary.items():
         corr_g.create_dataset(prefix, data=_np.asarray(s["corr_intra"]))
-    rhat_g = summary.create_group("rhat")
-    ess_g = summary.create_group("ess")
-    for prefix in samp.summary:
-        rhat_g.create_dataset(prefix, data=_np.asarray(samp.rhat[prefix]))
-        ess_g.create_dataset(prefix, data=_np.asarray(samp.ess[prefix]))
+    if getattr(samp, "rhat", None) is not None:
+        rhat_g = summary.create_group("rhat")
+        ess_g = summary.create_group("ess")
+        for prefix in samp.summary:
+            rhat_g.create_dataset(prefix, data=_np.asarray(samp.rhat[prefix]))
+            ess_g.create_dataset(prefix, data=_np.asarray(samp.ess[prefix]))
     if save_cross_corr:
-        prefixes = list(samp.summary.keys())
-        cols = []
-        for p in prefixes:
-            v = samp.samples_phys[p]
-            cols.append(v.reshape(-1, v.shape[-1]))  # (nc*ns, Nt)
-        flat = _np.concatenate(cols, axis=1)         # (nc*ns, sum Nt)
-        with _np.errstate(divide="ignore", invalid="ignore"):
-            cc = _np.corrcoef(flat.T)
-        cc = _np.where(_np.isfinite(cc), cc, 0.0)
-        _np.fill_diagonal(cc, 1.0)
-        summary.create_dataset("cross_correlations", data=cc)
-        # Index strings so a reader can decode the row/col order.
-        idx_labels = []
-        for p in prefixes:
-            v = samp.samples_phys[p]
-            for t in range(v.shape[-1]):
-                idx_labels.append(f"{p}[t={t}]")
-        summary.create_dataset(
-            "cross_correlations_labels",
-            data=_np.array(idx_labels, dtype=h5py.string_dtype()),
-        )
+        if has_samples:
+            prefixes = list(samp.summary.keys())
+            cols = []
+            for p in prefixes:
+                v = samp.samples_phys[p]
+                cols.append(v.reshape(-1, v.shape[-1]))  # (nc*ns, Nt)
+            flat = _np.concatenate(cols, axis=1)         # (nc*ns, sum Nt)
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                cc = _np.corrcoef(flat.T)
+            cc = _np.where(_np.isfinite(cc), cc, 0.0)
+            _np.fill_diagonal(cc, 1.0)
+            idx_labels = []
+            for p in prefixes:
+                v = samp.samples_phys[p]
+                for t in range(v.shape[-1]):
+                    idx_labels.append(f"{p}[t={t}]")
+        elif getattr(samp, "cov_phys", None) is not None:
+            # Laplace-only: derive the cross-correlation from Σ_phys.
+            sig = _np.sqrt(_np.clip(_np.diag(samp.cov_phys), 0.0, None))
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                cc = samp.cov_phys / _np.outer(sig, sig)
+            cc = _np.where(_np.isfinite(cc), cc, 0.0)
+            _np.fill_diagonal(cc, 1.0)
+            idx_labels = list(samp.cov_phys_labels)
+        else:
+            cc = None
+        if cc is not None:
+            summary.create_dataset("cross_correlations", data=cc)
+            # Index strings so a reader can decode the row/col order.
+            summary.create_dataset(
+                "cross_correlations_labels",
+                data=_np.array(idx_labels, dtype=h5py.string_dtype()),
+            )
 
-    summary.attrs["n_chains"]       = int(samp.n_chains)
-    summary.attrs["n_samples"]      = int(samp.n_samples)
-    summary.attrs["burn_in"]        = int(samp.burn_in)
-    summary.attrs["thin"]           = int(samp.thin)
-    summary.attrs["temperature"]    = float(samp.temperature)
-    summary.attrs["step_size_final"] = float(samp.step_size_final)
-    summary.attrs["precond"]        = str(samp.precond)
-    summary.attrs["max_rhat"]       = float(samp.max_rhat)
-    summary.attrs["max_rhat_key"]   = str(samp.max_rhat_key)
-    summary.attrs["min_ess"]        = float(samp.min_ess)
-    summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
-    summary.attrs["wall_time_s"]    = float(samp.wall_time)
+    summary.attrs["method"]      = str(getattr(samp, "method", "mcmc"))
+    summary.attrs["kernel"]      = str(getattr(samp, "kernel", "sgld"))
+    summary.attrs["temperature"] = float(samp.temperature)
+    summary.attrs["wall_time_s"] = float(samp.wall_time)
+    if has_samples:
+        summary.attrs["n_chains"]       = int(samp.n_chains)
+        summary.attrs["n_samples"]      = int(samp.n_samples)
+        summary.attrs["burn_in"]        = int(samp.burn_in)
+        summary.attrs["thin"]           = int(samp.thin)
+        summary.attrs["step_size_final"] = float(samp.step_size_final)
+        summary.attrs["precond"]        = str(samp.precond)
+        summary.attrs["max_rhat"]       = float(samp.max_rhat)
+        summary.attrs["max_rhat_key"]   = str(samp.max_rhat_key)
+        summary.attrs["min_ess"]        = float(samp.min_ess)
+        summary.attrs["min_ess_key"]    = str(samp.min_ess_key)
+        if getattr(samp, "kernel", "sgld") in ("hmc", "mala"):
+            summary.attrs["n_leapfrog"]   = int(samp.n_leapfrog)
+            summary.attrs["traj_length"]  = float(getattr(samp, "traj_length", 0.0))
+            summary.attrs["avg_leapfrog"] = float(getattr(samp, "avg_leapfrog", 0.0))
+            summary.attrs["accept_rate"]  = _np.asarray(samp.accept_rate)
+            summary.attrs["n_divergent"]  = int(samp.n_divergent)
 
     # Always save the param ordering (it labels both the Hessian axes and the
     # u-space arrays) and the full Hessian of the log-posterior at the MAP.
@@ -534,6 +666,9 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
     # Laplace physical-parameter covariance at the MAP: the full (singular) P×P
     # matrix plus per-prefix 1σ error bars (sqrt of its diagonal), so they sit
     # alongside summary/std. Row/col order of cov_phys matches cov_phys_labels.
+    # Non-identified (flat) directions are exported as relative physical
+    # loadings so a reader can see which parameter combinations the data
+    # cannot pin down.
     if getattr(samp, "cov_phys", None) is not None:
         lap = fh.create_group("laplace")
         lap.create_dataset("cov_phys", data=_np.asarray(samp.cov_phys))
@@ -545,8 +680,17 @@ def _write_sampling_summary(fh, samp, *, save_cross_corr=True,
         for prefix, arr in samp.laplace_sigma.items():
             sig_g.create_dataset(prefix, data=_np.asarray(arr))
         lap.attrs["n_nonidentified"] = int(getattr(samp, "n_nonidentified", 0))
+        loadings = getattr(samp, "nonid_loadings", None)
+        if loadings is not None and len(loadings):
+            lap.create_dataset("nonidentified_loadings",
+                               data=_np.asarray(loadings))
+            lap.create_dataset(
+                "nonidentified_descriptions",
+                data=_np.array(getattr(samp, "nonid_descriptions", []),
+                               dtype=h5py.string_dtype()),
+            )
 
-    if save_samples:
+    if save_samples and has_samples:
         samples_grp = fh.create_group("samples")
         for prefix, arr in samp.samples_phys.items():
             samples_grp.create_dataset(prefix, data=_np.asarray(arr))
