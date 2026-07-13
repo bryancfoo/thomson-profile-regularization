@@ -324,8 +324,10 @@ def _make_sharded_nll(measurement_settings, Pkl_data, Pkl_var, Nt, n_dev, has_bg
     data_p = jnp.pad(jnp.asarray(Pkl_data), ((0, 0), (0, pad)), constant_values=jnp.nan)
     var_p  = jnp.pad(jnp.asarray(Pkl_var),  ((0, 0), (0, pad)), constant_values=jnp.nan)
 
-    # Per-time IRF (Nk, Nt): pad+shard along time. If absent (or not 2-D), pass a
-    # tiny dummy that the forward ignores.
+    # Per-time IRF (Nk, Nt): pad+shard along time. A 1-D (L,) uniform IRF needs
+    # no sharding — it rides along in measurement_settings and applies whole to
+    # each shard's time block. If absent or 1-D, pass a tiny dummy that the
+    # forward ignores.
     _irf = measurement_settings.get("instr_func_arr", None)
     has_time_irf = _irf is not None and jnp.ndim(jnp.asarray(_irf)) == 2
     if has_time_irf:

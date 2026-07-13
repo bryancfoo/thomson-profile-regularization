@@ -6,6 +6,8 @@
 #     D/C thermal equilibrium (Ti1 = Ti0)
 #   * [[extra_params]] introducing a dummy free variable that constraints
 #     can reference by name
+#   * irf_mode = "gaussian" — synthetic Gaussian IRF from a pixel-space σ
+#     instead of a measured IRF array
 #   * sgld_lbfgs optimizer (SGLD warmup → LBFGS refinement)
 #
 # Run:
@@ -28,8 +30,13 @@ ue_dir           = [1.0, 0.0, 0.0]
 ui_dir           = [1.0, 0.0, 0.0]
 wavelengths        = "../data/data_iaw.h5:wavelengths"
 normalization_type = "max"
-# Per-time Gaussian IRF (FWHM ≈ 25 pm) baked into data_iaw.h5.
-instr_func_arr     = "../data/data_iaw.h5:irf"
+# The data has a Gaussian IRF (FWHM ≈ 25 pm ⇒ σ ≈ 1.63 px) baked in. Instead
+# of convolving with the stored array (see iaw_full for that path), this deck
+# uses irf_mode = "gaussian" to build a clean unit-area Gaussian from its
+# pixel-space σ — the right tool when the measured IRF is too noisy to use
+# directly.
+irf_mode           = "gaussian"
+irf_sigma_px       = 1.63
 irf_normalization  = "area"
 # Wavelength-dependent throughput, also baked into data_iaw.h5.  (Deck 3
 # loads the same array from a CSV to demonstrate the other file format.)

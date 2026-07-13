@@ -31,8 +31,15 @@ wavelengths        = "../data/data_iaw.h5:wavelengths"
 normalization_type = "max"
 
 # Per-time IRF (Nk, Nt) — Gaussian FWHM ≈ 25 pm baked into data_iaw.h5.
+# irf_mode = "array" (the default, explicit here) reads the IRF as given;
+# a 1-D (L,) array would apply one kernel at every time step.
+irf_mode           = "array"
 instr_func_arr     = "../data/data_iaw.h5:irf"
 irf_normalization  = "area"
+# If the measured IRF were too noisy to convolve with directly, swap the two
+# lines above for a synthetic Gaussian of the same width (σ in pixels):
+#   irf_mode     = "gaussian"
+#   irf_sigma_px = 1.63
 
 # Wavelength-dependent throughput (Nk,) — newline-separated CSV.
 throughput         = "../data/throughput.csv"

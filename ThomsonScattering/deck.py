@@ -90,6 +90,28 @@ def _load_array(value, base_dir):
         )
 
 
+def _gaussian_irf(sigma_px, Nk):
+    """Build a (L,) unit-area Gaussian IRF from a pixel-space std dev.
+
+    The kernel is odd-length and exactly centered, so the ``mode="same"``
+    convolution in the forward model imparts no wavelength shift. Its length
+    covers ±4σ (negligible tails beyond), capped at the spectral window so
+    the convolved output keeps length Nk. A 1-D IRF is applied uniformly at
+    every time step — this mode has no time dependence by construction.
+    """
+    if not sigma_px > 0:
+        raise ValueError(
+            f"[measurement] irf_sigma_px must be a positive number of pixels, "
+            f"got {sigma_px!r}"
+        )
+    L = 2 * int(_np.ceil(4.0 * sigma_px)) + 1
+    if L > Nk:
+        L = Nk if Nk % 2 == 1 else Nk - 1
+    x = _np.arange(L) - L // 2
+    kernel = _np.exp(-0.5 * (x / sigma_px) ** 2)
+    return kernel / kernel.sum()
+
+
 def _require(d, keys, section):
     missing = [k for k in keys if k not in d]
     if missing:
@@ -168,6 +190,48 @@ def build_settings_from_deck(deck):
             measurement_settings[key] = tuple(val)
         else:
             measurement_settings[key] = val
+
+    # ── IRF mode ────────────────────────────────────────────────────────────
+    # "array" (default): instr_func_arr is used as given — loaded from a file/
+    # list here, or injected upstream by the CLI's [measurement.irf_hdf4]
+    # extension. "gaussian": ignore any measured IRF and build a clean
+    # unit-area Gaussian from irf_sigma_px (std dev in pixels), applied
+    # identically at every time step — for when the measured IRF is too noisy
+    # (negative lobes, artifacts) to convolve with directly.
+    irf_mode = measurement_settings.pop("irf_mode", "array")
+    irf_sigma_px = measurement_settings.pop("irf_sigma_px", None)
+    if irf_mode == "gaussian":
+        if irf_sigma_px is None:
+            raise ValueError(
+                "[measurement] irf_mode = 'gaussian' requires irf_sigma_px "
+                "(Gaussian standard deviation in pixels)."
+            )
+        if "instr_func_arr" in measurement_settings:
+            raise ValueError(
+                "[measurement] irf_mode = 'gaussian' conflicts with an "
+                "explicit IRF array. Remove instr_func_arr (or the "
+                "[measurement.irf_hdf4] section), or set irf_mode = 'array'."
+            )
+        measurement_settings["instr_func_arr"] = _gaussian_irf(
+            float(irf_sigma_px), len(measurement_settings["wavelengths"])
+        )
+    elif irf_mode == "array":
+        if irf_sigma_px is not None:
+            raise ValueError(
+                "[measurement] irf_sigma_px only applies when irf_mode = "
+                "'gaussian'; remove it or switch irf_mode."
+            )
+        _irf = measurement_settings.get("instr_func_arr")
+        if _irf is not None and _irf.ndim not in (1, 2):
+            raise ValueError(
+                f"[measurement] instr_func_arr has shape {_irf.shape}; "
+                f"expected (L,) for a time-independent IRF or (L, Nt) with "
+                f"one column per time step."
+            )
+    else:
+        raise ValueError(
+            f"[measurement] irf_mode must be 'gaussian' or 'array', got {irf_mode!r}"
+        )
 
     # Optional probe-beam parameters for the SRS/SBS gain correction
     # (Turnbull et al., PRL 136, 135101 (2026)). Absent section ⇒ correction

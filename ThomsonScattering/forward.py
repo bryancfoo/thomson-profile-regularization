@@ -356,12 +356,19 @@ def scattered_power_wavelength(
 
     # Here I assume that the instrument function is applied to the scattered power
     # and not to Skw, which I think is what the file I get from Joe Katz does...
+    # A 1-D (L,) IRF applies the same kernel at every time step; a 2-D (L, Nt)
+    # IRF gives each time step its own column. Either way the convolution is
+    # 1-D along wavelength — not 2D, to avoid time smearing.
     if instr_func_arr is not None:
-        # Assuming a time-dependent instrument function, we use jax.vmap to apply the
-        # relevant convolution to each time step
-        # Not using 2D convolution to avoid time smearing
-        Pklam = vmap(lambda p, i: jnp.convolve(p, i, mode="same"), in_axes=1, out_axes=1)(Pklam, instr_func_arr)
-        # Renormalize so amplitude isn't coupled to PSF area / peak.
+        if jnp.ndim(instr_func_arr) == 1:
+            Pklam = vmap(lambda p: jnp.convolve(p, instr_func_arr, mode="same"),
+                         in_axes=1, out_axes=1)(Pklam)
+        else:
+            Pklam = vmap(lambda p, i: jnp.convolve(p, i, mode="same"),
+                         in_axes=1, out_axes=1)(Pklam, instr_func_arr)
+        # Renormalize so amplitude isn't coupled to PSF area / peak. Per time
+        # column for a 2-D IRF; the 1-D case reduces to shape (1,), which
+        # broadcasts as a scalar.
         if irf_normalization == "area":
             Pklam = Pklam / jnp.sum(instr_func_arr, axis=0, keepdims=True)
         elif irf_normalization == "peak":
