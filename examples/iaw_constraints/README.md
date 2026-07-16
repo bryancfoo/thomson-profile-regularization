@@ -6,6 +6,13 @@ equilibrium (`Ti1 = Ti0`) and charge-balance with a floor
 `[[extra_params]]` dummy that the optimizer is free to move.
 Optimizer: SGLD warmup → LBFGS.
 
+Also demonstrates `irf_mode = "gaussian"`: instead of convolving with the
+IRF array stored in the data file (see `iaw_full` for that path), the deck
+gives only the IRF's standard deviation in pixels (`irf_sigma_px = 1.63`,
+matching the FWHM ≈ 25 pm Gaussian baked into the synthetic data) and the
+parser builds a clean unit-area Gaussian kernel — useful when a measured
+IRF is too noisy to use directly.
+
 ```bash
 python examples/data/make_data_iaw.py   # one-time
 thomson-fit fit.toml                    # writes fit_result.h5

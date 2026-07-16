@@ -39,16 +39,20 @@ Examples live under [`examples/`](examples/), one subdirectory per deck:
 |---|---|
 | [`examples/epw_basic/`](examples/epw_basic/) | minimal antiStokes-EPW fit, single ion, LBFGS |
 | [`examples/forward_only/`](examples/forward_only/) | forward model from `[profiles]`, no fitting |
-| [`examples/iaw_constraints/`](examples/iaw_constraints/) | multi-ion IAW + `[constraints]` + `[[extra_params]]` + SGLD→LBFGS |
+| [`examples/iaw_constraints/`](examples/iaw_constraints/) | multi-ion IAW + `[constraints]` + `[[extra_params]]` + `irf_mode = "gaussian"` + SGLD→LBFGS |
 | [`examples/iaw_sample/`](examples/iaw_sample/) | same as `iaw_constraints` plus posterior sampling |
 | [`examples/iaw_l_curve/`](examples/iaw_l_curve/) | same as `iaw_constraints` plus `[penalty.*]` + `[l_curve]` Tikhonov sweep |
 | [`examples/iaw_full/`](examples/iaw_full/) | "kitchen sink": IRF + throughput + `notch` + `background_order` + `[probe_beam]` + `[penalty.*]` + Adam |
+| [`examples/iaw_kappa/`](examples/iaw_kappa/) | `[species]` with the built-in `kappa` ion model (general quadrature path) |
+| [`examples/epw_custom_dist/`](examples/epw_custom_dist/) | user-supplied distribution callable (bi-Maxwellian electrons) |
 
 Generate the shared synthetic data, then run any example:
 
 ```bash
-python examples/data/make_data_epw.py     # → examples/data/data_epw.h5
-python examples/data/make_data_iaw.py     # → examples/data/data_iaw.h5  +  throughput.csv
+python examples/data/make_data_epw.py        # → examples/data/data_epw.h5
+python examples/data/make_data_iaw.py        # → examples/data/data_iaw.h5  +  throughput.csv
+python examples/data/make_data_kappa.py      # → examples/data/data_kappa.h5
+python examples/data/make_data_epw_2temp.py  # → examples/data/data_epw_2temp.h5
 
 cd examples/epw_basic && thomson-fit fit.toml && python plot.py
 cd examples/iaw_sample && thomson-fit fit.toml && python plot.py    # error bands rendered from posterior
@@ -136,9 +140,13 @@ ue_dir             = [1.0, 0.0, 0.0]            # electron drift dir
 ui_dir             = [1.0, 0.0, 0.0]            # ion drift dir
 wavelengths        = "data.h5:wavelengths"      # (Nk,) meters
 
-# Optional:
-instr_func_arr     = "data.h5:irf"              # (Nk,) or (Nk, Nt) IRF
+# Optional — instrument response function (see "IRF modes" below):
+irf_mode           = "array"                    # "array" (default) | "gaussian"
+instr_func_arr     = "data.h5:irf"              # (L,) or (L, Nt) IRF — irf_mode = "array"
+irf_sigma_px       = 1.6                        # Gaussian σ in px — irf_mode = "gaussian"
 irf_normalization  = "area"                     # "area" | "peak" | "none"
+
+# Optional:
 throughput         = "throughput.csv"           # (Nk,) sensitivity
 aperture_weights   = [0.25, 0.5, 0.25]          # (Nangles,) — needs (Nangles, 3) scatter_vec
 notch              = [263.249e-9, 263.251e-9]   # mask wavelengths inside
@@ -146,6 +154,26 @@ background_order   = 1                          # adds bg0..bgK params
 normalization_type = "max"                      # "max" | "sum" | "integral"
 normalization_scale = 1                         # multiplier on the norm
 ```
+
+**IRF modes.** The forward model convolves each time step's spectrum with
+an IRF kernel along the wavelength axis. It accepts either a 1-D `(L,)`
+kernel, applied uniformly at every time step, or a 2-D `(L, Nt)` array
+giving each time step its own column (`L` is the kernel length, usually
+`Nk`). `irf_mode` selects how the deck provides it:
+
+- `irf_mode = "array"` (default) — supply the measured IRF explicitly via
+  `instr_func_arr` (file / list / HDF5 reference, or the CLI's
+  `[measurement.irf_hdf4]` extension), in either shape above.
+- `irf_mode = "gaussian"` — supply `irf_sigma_px`, the Gaussian standard
+  deviation **in pixels**. The parser builds a unit-area, exactly-centered
+  1-D Gaussian kernel (odd length, spanning ±4σ), uniform across time.
+  Use this when the measured IRF is too noisy to convolve with directly
+  (negative lobes, numerical artifacts). Setting `instr_func_arr` (or
+  `[measurement.irf_hdf4]`) together with this mode is an error.
+
+In both modes `irf_normalization` controls the renormalization applied
+after the convolution (per time column for a 2-D IRF). Omitting
+`instr_func_arr` in array mode skips the IRF convolution entirely.
 
 ### `[species]` — per-species velocity-distribution models (optional)
 
@@ -634,6 +662,10 @@ slice_mode     = "uniform"       # "uniform" | "per_slice"
 N_avg          = 50              # required for "per_slice"
 ```
 
+`[measurement.irf_hdf4]` feeds the `irf_mode = "array"` path (it resolves
+into `instr_func_arr`), so it cannot be combined with
+`irf_mode = "gaussian"`.
+
 ---
 
 ## 4. Forward deck schema
@@ -657,7 +689,8 @@ efract = [...]
 ifract = [...]                   # (Nions, Nt) — should sum to 1 over ions
 
 [measurement]
-# same as fit-deck [measurement]
+# same as fit-deck [measurement], except irf_mode = "gaussian" is
+# fit-deck-only — forward decks must pass the IRF as instr_func_arr
 
 [probe_beam]
 # optional, same as fit-deck
@@ -861,9 +894,10 @@ The six example subdirectories, each with its own `fit.toml`/`forward.toml`,
   deck's `[profiles]` block, useful for sanity-checking that geometry /
   wavelength window agree with the fitter's view.
 - [`examples/iaw_constraints/`](examples/iaw_constraints/) — `data_iaw.h5`,
-  applies `instr_func_arr` and `throughput` (both from HDF5). Free params:
-  `Te0`, `Ti0`, `ifract0`, `ifract1_floor`. `[constraints]` sets
-  `Ti1 = Ti0` and `ifract1 = max(ifract1_floor, 1 - ifract0)`.
+  applies a synthetic Gaussian IRF (`irf_mode = "gaussian"`, σ in pixels
+  matching the IRF baked into the data) and `throughput` (from HDF5).
+  Free params: `Te0`, `Ti0`, `ifract0`, `ifract1_floor`. `[constraints]`
+  sets `Ti1 = Ti0` and `ifract1 = max(ifract1_floor, 1 - ifract0)`.
   Optimizer: SGLD → LBFGS.
 - [`examples/iaw_sample/`](examples/iaw_sample/) — identical physics to
   `iaw_constraints` plus a `[sampling]` block that triggers preconditioned
@@ -876,7 +910,9 @@ The six example subdirectories, each with its own `fit.toml`/`forward.toml`,
   optimal-λ result is saved as the top-level `/best_fit`; the full sweep
   lands under `/l_curve`. `plot.py` adds a per-λ profile overlay.
 - [`examples/iaw_full/`](examples/iaw_full/) — `data_iaw.h5`, applies IRF
-  (from HDF5), throughput (from CSV — demonstrating the file-loading path),
+  (`irf_mode = "array"`, loaded from HDF5, with a commented-out
+  `irf_mode = "gaussian"` alternative),
+  throughput (from CSV — demonstrating the file-loading path),
   `notch`, `background_order = 1`, `[probe_beam]` (with `gain_mode = "off"`
   so the section is parsed but the correction is disabled), and
   `[penalty.*]` Tikhonov terms. Optimizer: Adam.

@@ -28,10 +28,13 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 FAIL = []
 
 # Reference final losses recorded from the validated parity run (2026-07-02,
-# promotion of the rewrite; identical for old and new packages).
+# promotion of the rewrite; identical for old and new packages). The
+# iaw_constraints reference was re-recorded after the deck switched to
+# irf_mode = "gaussian" (2026-07-13 port from main; the array-mode deck's
+# reference was 2.4358528 at the same nit).
 REFERENCE = {
-    "examples/epw_basic/fit.toml":       {"loss": 0.99565696, "nit": 120},
-    "examples/iaw_constraints/fit.toml": {"loss": 2.4358528,  "nit": 316},
+    "examples/epw_basic/fit.toml":       {"loss": 0.99565696,  "nit": 120},
+    "examples/iaw_constraints/fit.toml": {"loss": 3.682913352, "nit": 316},
 }
 
 
